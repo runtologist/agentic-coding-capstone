@@ -198,13 +198,13 @@ object Main extends ZIOAppDefault {
       // Idiomatic ZIO: read stdin through the Console service rather than
       // touching scala.io.Source.stdin inside a blocking attempt.
       readAllStdin
-        .mapError(e => TabbyError.IoError("eval-file", ioMessage(e)))
+        .mapError(e => TabbyError.IoError("eval-file", TabbyError.ioMessage(e)))
     } else {
       ZIO
         .attemptBlocking(
           new String(Files.readAllBytes(Paths.get(target)), StandardCharsets.UTF_8)
         )
-        .mapError(e => TabbyError.IoError("eval-file", ioMessage(e)))
+        .mapError(e => TabbyError.IoError("eval-file", TabbyError.ioMessage(e)))
     }
   }
 
@@ -386,7 +386,4 @@ object Main extends ZIOAppDefault {
       else message
     printOut(styled + "\n")
   }
-
-  private def ioMessage(error: Throwable): String =
-    Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.getClass.getSimpleName)
 }

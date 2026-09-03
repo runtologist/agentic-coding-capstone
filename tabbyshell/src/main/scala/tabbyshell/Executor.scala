@@ -105,7 +105,7 @@ object Executor {
               stream.close()
             }
           }
-          .mapError(e => TabbyError.IoError("ls", ioMessage(e)))
+          .mapError(e => TabbyError.IoError("ls", TabbyError.ioMessage(e)))
       }
   }
 
@@ -172,7 +172,7 @@ object Executor {
           Right(state.copy(cwd = path.toAbsolutePath.normalize.toString, prevCwd = Some(state.cwd)))
         }
       }
-      .mapError(e => TabbyError.IoError("cd", ioMessage(e)))
+      .mapError(e => TabbyError.IoError("cd", TabbyError.ioMessage(e)))
       .flatMap(ZIO.fromEither)
   }
 
@@ -511,7 +511,7 @@ object Executor {
             val path = Paths.get(resolved)
             Files.write(path, content.getBytes(StandardCharsets.UTF_8))
           }
-          .mapError(e => TabbyError.IoError("save", ioMessage(e)))
+          .mapError(e => TabbyError.IoError("save", TabbyError.ioMessage(e)))
           .as(VNull)
       }
   }
@@ -667,7 +667,7 @@ object Executor {
   private def readFile(command: String, path: String): IO[TabbyError, String] = {
     ZIO
       .attemptBlocking(new String(Files.readAllBytes(Paths.get(path)), StandardCharsets.UTF_8))
-      .mapError(e => TabbyError.IoError(command, ioMessage(e)))
+      .mapError(e => TabbyError.IoError(command, TabbyError.ioMessage(e)))
   }
 
   private def posixMode(path: Path): String = {
@@ -710,7 +710,4 @@ object Executor {
     else if (value < Int.MinValue.toLong) Int.MinValue
     else value.toInt
   }
-
-  private def ioMessage(error: Throwable): String =
-    Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.getClass.getSimpleName)
 }

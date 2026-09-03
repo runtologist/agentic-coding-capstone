@@ -27,7 +27,7 @@ object External {
           val exit = process.waitFor()
           (exit, stdout)
         }
-        .mapError(e => TabbyError.IoError(name, ioMessage(e)))
+        .mapError(e => TabbyError.IoError(name, TabbyError.ioMessage(e)))
       (exit, stdout) = result
       value <-
         if (exit != 0) ZIO.fail(TabbyError.ExternalFailed(name, exit))
@@ -212,7 +212,4 @@ object External {
       trimmed
     }
   }
-
-  private def ioMessage(error: Throwable): String =
-    Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.getClass.getSimpleName)
 }
