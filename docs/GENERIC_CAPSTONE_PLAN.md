@@ -132,6 +132,38 @@ Review output requirements:
   considered green.
 - Reviewers must not edit production code; only reports are written.
 
+### Phase F — Fix round (one subagent per item, parallel where safe)
+
+Validated on TabbyShell (2026-09-03): after a review produces N actionable
+findings, fix them with **one dedicated subagent per review item**, never one
+mega-fix agent, and never hand-editing in the parent session.
+
+1. Group findings into items; group coupled files into one item (e.g. a
+   parser signature change plus its call sites must share a lane — splitting
+   them breaks compilation between merges).
+2. Items with disjoint file sets run as **parallel worktree lanes**
+   (`worktree: true`, one writer each). Each lane's packet includes: exact
+   file scope, required change, spec citation, and the full gate set it must
+   pass before committing (compile, unit tests, assembly, scalafmt, official
+   harness).
+3. The parent integrates **sequentially**: merge one lane at a time into
+   `main`, then re-run the full gate set after the final merge. Disjoint file
+   sets merge cleanly; verify commit claims against the actual diff
+   (`git show`), never against commit messages alone.
+4. Items that depend on the integrated state (e.g. unit tests for the fixed
+   behaviors) run after integration, as their own single subagent.
+5. A final parallel review pass (spec-compliance + code-quality, read-only)
+   closes the round; findings re-enter this phase.
+
+Gotchas learned:
+- Managed worktree lanes may lose their branch refs when the worktree is
+  cleaned up; merge by commit hash if the branch is gone (commits remain
+  reachable).
+- Lanes must not touch shared mutable files (docs, reports) concurrently with
+  the parent; keep integration-only writes in the parent session.
+- After a merge, always rebuild the assembly jar before running the harness —
+  a stale jar silently passes with pre-merge behavior.
+
 ## 4. Git workflow
 
 - `main` — always green (full harness passes).
