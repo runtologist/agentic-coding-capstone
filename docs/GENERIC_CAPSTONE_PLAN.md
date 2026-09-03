@@ -219,3 +219,47 @@ Findings from building TabbyShell with Scala 3.3.8 + ZIO 2.1.26 on Java 25 LTS:
    - Verification command to enforce this in review:
      `grep -rn "System\.\(out\|err\|exit\)\|println(" src/main/scala` must
      return only the documented exceptions.
+10. **Toolchain:** this machine has no system Java (`/usr/bin/java` stub
+    fails); sbt is the Coursier launcher. Every sbt invocation needs
+    `JAVA_HOME=/opt/homebrew/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home`
+    exported (see `scripts/env.sh`, which scripts source). Source the env
+    script before any sbt/verify command.
+11. **Stale build artifacts:** after changing `scalaVersion`, delete old
+    `target/scala-<old>/` dirs or the harness may pick up a stale assembly
+    jar.
+
+## 8. Adversarial review findings (TabbyShell dry run, 2026-09-03)
+
+Three review lanes (spec compliance, code quality, dynamic probing) ran
+against the green 50/50 implementation. The full reports are in
+`docs/reviews/`. Lessons that carry into Snap:
+
+### Fixed immediately (would have been caught only by spec re-reading, not tests)
+1. **`last` with no argument returned the FIRST element** (`headOption` used
+   for both directions). Classic copy-paste bug invisible to a suite that only
+   tests `last 1`. Fixed to `lastOption` for both Table and List.
+2. **`sort-by --reverse` tie order wrong.** Implementation negated the
+   comparator (stable descending), spec says "reverse the result" — ties must
+   appear in reverse input order. Fixed: sort stable ascending, then reverse.
+3. **Numeric comparison went through `Double`**, silently breaking 64-bit
+   Int/Filesize comparisons above 2^53. Fixed: exact `Long.compare` for
+   Int/Filesize pairs, `BigDecimal` when a `Float` is involved.
+
+### Open items for Snap (process, not code)
+1. **Write real unit tests, not just pass-the-harness.** The only unit test
+   was `VersionSpec`; every P1 bug above was invisible to both unit tests and
+   the public suite. Minimum for Snap: spec per module (parser, renderer,
+   formatters, comparators, edge cases).
+2. **Pin error-message contracts.** Several messages diverge from the spec's
+   `command: expected X, got Y` shape (e.g. bool/null operator restrictions,
+   `length` on wrong type). Spec ambiguities (CSV ragged rows, `.5` numbers,
+   unicode idents, external rendering of literal args) should be raised with
+   the spec owner before hidden tests are written, not after.
+3. **Process artifacts were skipped:** no frozen `CONTRACT.md`, no
+   develop/task branches (all work landed on `main` in 3 commits), no saved
+   gate evidence, no CI. For Snap: create `docs/snap/CONTRACT.md` first,
+   branch per task packet, save gate output, add a CI workflow.
+4. **Environment gotchas:** JVM emits `sun.misc.Unsafe` deprecation warnings
+   on stderr under Java 25 (harmless for contains-based assertions but noisy
+   for exact-stderr assertions); harness prefers
+   `/opt/homebrew/opt/openjdk/bin/java` over `PATH` when present.
