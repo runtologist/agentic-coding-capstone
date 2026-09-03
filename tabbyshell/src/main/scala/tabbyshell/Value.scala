@@ -1,5 +1,7 @@
 package tabbyshell
 
+import scala.annotation.tailrec
+
 enum Value {
   case VNull
   case VBool(value: Boolean)
@@ -71,8 +73,18 @@ object Value {
       identity
     )
 
-  private def duplicateKey(keys: List[String]): Option[String] =
-    keys.groupBy(identity).collectFirst { case (key, occurrences) if occurrences.size > 1 => key }
+  private def duplicateKey(keys: List[String]): Option[String] = {
+    @tailrec
+    def loop(remaining: List[String], seen: Set[String]): Option[String] =
+      remaining match {
+        case Nil => None
+        case key :: rest =>
+          if (seen(key)) Some(key)
+          else loop(rest, seen + key)
+      }
+
+    loop(keys, Set.empty)
+  }
 
   def typeName(value: Value): String = value match {
     case VNull        => "null"

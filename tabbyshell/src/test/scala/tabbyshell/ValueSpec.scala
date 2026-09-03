@@ -25,6 +25,12 @@ object ValueSpec extends ZIOSpecDefault {
           case Left(ConstructionError.DuplicateKey(key)) => assertTrue(key == "a")
           case _                                         => assertTrue(false)
         }
+      },
+      test("reports the first duplicate key in left-to-right scan order") {
+        Value.record(List("b" -> VNull, "a" -> VNull, "b" -> VInt(1L), "a" -> VInt(2L))) match {
+          case Left(ConstructionError.DuplicateKey(key)) => assertTrue(key == "b")
+          case _                                         => assertTrue(false)
+        }
       }
     ),
     suite("table smart constructor")(
@@ -53,6 +59,12 @@ object ValueSpec extends ZIOSpecDefault {
       test("rejects duplicate columns with DuplicateColumn") {
         Value.table(List("a", "b", "a"), List.empty) match {
           case Left(ConstructionError.DuplicateColumn(column)) => assertTrue(column == "a")
+          case _                                               => assertTrue(false)
+        }
+      },
+      test("reports the first duplicate column in left-to-right scan order") {
+        Value.table(List("b", "a", "b", "a"), List.empty) match {
+          case Left(ConstructionError.DuplicateColumn(column)) => assertTrue(column == "b")
           case _                                               => assertTrue(false)
         }
       },

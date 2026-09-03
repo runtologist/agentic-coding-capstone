@@ -12,6 +12,11 @@ object Csv {
     } else {
       val columns = rows.head
       val dataRows = rows.drop(1).map(_.map(Value.VStr.apply))
+      // Ragged rows are rejected by Value.table with ConstructionError.RaggedTable and
+      // surfaced by `open` as BadArg ("open: row N has M columns, expected K"). SPEC §2
+      // describes ragged input as a TypeMismatch, but the §3.3 TypeMismatch format
+      // ("expected <type>, got <type>") cannot express a row-width mismatch, so this
+      // documented deviation keeps the more informative message.
       Value.table(columns, dataRows).left.map(_.message)
     }
   }
