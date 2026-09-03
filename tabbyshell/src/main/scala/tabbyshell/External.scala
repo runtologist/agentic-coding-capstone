@@ -111,7 +111,7 @@ object External {
       case Some(raw) =>
         val cleaned = raw.stripSuffix("/")
         if (cleaned.endsWith("/chat/completions")) cleaned
-        else if (cleaned.endsWith("/api/v1")) cleaned + "/chat/completions"
+        else if (cleaned.endsWith("/v1")) cleaned + "/chat/completions"
         else cleaned + "/api/v1/chat/completions"
     }
   }
@@ -162,12 +162,8 @@ object External {
               case VList(rowItems) => parseRows(rowItems)
               case _               => Left("rows must be an array")
             }
-          } yield {
-            val normalizedRows = rows.map { row =>
-              columns.indices.map(i => row.lift(i).getOrElse(VStr(""))).toList
-            }
-            VTable(columns, normalizedRows)
-          }
+            table <- Value.table(columns, rows).left.map(_.message)
+          } yield table
         case _ => Left(s"unknown kind: $kind")
       }
     } yield value
