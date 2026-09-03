@@ -1,4 +1,4 @@
-ThisBuild / scalaVersion := "3.3.5"
+ThisBuild / scalaVersion := "3.3.8"
 ThisBuild / version := "0.1.0"
 ThisBuild / organization := "workshop.capstone"
 
@@ -10,8 +10,6 @@ lazy val root = (project in file("."))
     assembly / assemblyJarName := "tabbyshell-assembly-0.1.0.jar",
     libraryDependencies ++= Seq(
       "dev.zio" %% "zio" % "2.1.26",
-      "dev.zio" %% "zio-streams" % "2.1.26",
-      "dev.zio" %% "zio-json" % "1.0.0",
       "dev.zio" %% "zio-test" % "2.1.26" % Test,
       "dev.zio" %% "zio-test-sbt" % "2.1.26" % Test
     ),
@@ -19,8 +17,7 @@ lazy val root = (project in file("."))
     scalacOptions ++= Seq(
       "-deprecation",
       "-feature",
-      "-unchecked",
-      "-Wunused:imports"
+      "-unchecked"
     ),
     run / fork := true,
     run / connectInput := true,
