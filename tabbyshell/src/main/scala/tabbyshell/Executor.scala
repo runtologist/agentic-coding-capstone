@@ -100,7 +100,7 @@ object Executor {
                 if (showLong) List("name", "type", "size", "modified", "mode", "uid")
                 else List("name", "type", "size", "modified")
 
-              VTable(columns, rows)
+              Value.tableTrusted(columns, rows)
             } finally {
               stream.close()
             }
@@ -119,7 +119,7 @@ object Executor {
           if (fileName.endsWith(".json")) {
             ZIO
               .fromEither(Json.parse(content))
-              .mapError(_ => TabbyError.BadArg("open", "invalid JSON"))
+              .mapError(msg => TabbyError.BadArg("open", s"invalid JSON: $msg"))
           } else if (fileName.endsWith(".csv")) {
             ZIO
               .fromEither(Csv.parse(content))
@@ -198,7 +198,7 @@ object Executor {
         case i  => Right(i)
       }
       filtered <- filterRows(table.rows, columnIndex, op, literal)
-    } yield VTable(table.columns, filtered)
+    } yield Value.tableTrusted(table.columns, filtered)
 
     ZIO.fromEither(result)
   }
@@ -234,10 +234,10 @@ object Executor {
         Right(java.lang.Long.compare(a, b))
       case (VBool(a), VBool(b)) =>
         if (equalityOnly) Right(java.lang.Boolean.compare(a, b))
-        else Left(TabbyError.TypeMismatch("where", "bool with == or !=", Value.typeName(cell)))
+        else Left(TabbyError.BadArg("where", s"operator '$op' is not supported for bool values"))
       case (VNull, VNull) =>
         if (equalityOnly) Right(0)
-        else Left(TabbyError.TypeMismatch("where", "null with == or !=", Value.typeName(cell)))
+        else Left(TabbyError.BadArg("where", s"operator '$op' is not supported for null values"))
       case _ =>
         Left(TabbyError.TypeMismatch("where", Value.typeName(literal), Value.typeName(cell)))
     }
@@ -279,7 +279,7 @@ object Executor {
         val rows = table.rows.map { row =>
           indices.map(i => row.lift(i).getOrElse(VNull))
         }
-        VTable(columns, rows)
+        Value.tableTrusted(columns, rows)
       }
       ZIO.fromEither(result)
     }
@@ -298,7 +298,7 @@ object Executor {
         case i  => Right(i)
       }
       sortedRows <- sortRows(table.rows, columnIndex, reverse)
-    } yield table.copy(rows = sortedRows)
+    } yield Value.tableTrusted(table.columns, sortedRows)
 
     ZIO.fromEither(result)
   }
@@ -391,7 +391,7 @@ object Executor {
             case None =>
               val chosen = if (takeFirst) rows.headOption else rows.lastOption
               chosen match {
-                case Some(row) => Right(VRecord(columns.zip(row)))
+                case Some(row) => Right(Value.recordTrusted(columns.zip(row)))
                 case None      => Left(TabbyError.BadArg(command, "input is empty"))
               }
             case Some(count) =>
@@ -399,7 +399,7 @@ object Executor {
               else {
                 val n = clampToInt(count)
                 val selected = if (takeFirst) rows.take(n) else rows.takeRight(n)
-                Right(VTable(columns, selected))
+                Right(Value.tableTrusted(columns, selected))
               }
           }
         case VList(items) =>
@@ -492,7 +492,6 @@ object Executor {
         ZIO
           .attemptBlocking {
             val path = Paths.get(resolved)
-            Option(path.getParent).foreach(Files.createDirectories(_))
             Files.write(path, content.getBytes(StandardCharsets.UTF_8))
           }
           .mapError(e => TabbyError.IoError("save", ioMessage(e)))
