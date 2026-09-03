@@ -1,9 +1,21 @@
 package tabbyshell
 
-import zio.{ExitCode, IO, Scope, UIO, ZIO, ZIOAppArgs, ZIOAppDefault}
+import zio.{
+  Clock,
+  Console,
+  ExitCode,
+  IO,
+  Scope,
+  System => ZSystem,
+  UIO,
+  ZIO,
+  ZIOAppArgs,
+  ZIOAppDefault
+}
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
+import java.util.concurrent.TimeUnit
 import scala.jdk.CollectionConverters.*
 import scala.util.Try
 
@@ -72,24 +84,28 @@ object Main extends ZIOAppDefault {
       printOut(Version.line + "\n").as(ExitCode.success)
     } else {
       for {
-        env <- ZIO.attempt(java.lang.System.getenv()).orDie
+        homeEnv <- ZSystem.env("HOME").orDie
+        tabbyNowEnv <- ZSystem.env("TABBY_NOW").orDie
+        noColorEnv <- ZSystem.env("NO_COLOR").orDie
+        userHomeProp <- ZSystem.property("user.home").orDie
         cwd <- ZIO.attempt(Paths.get("").toAbsolutePath.normalize.toString).orDie
+        // ZIO has no built-in service for TTY detection; this raw call is
+        // deliberate and remains wrapped in ZIO.attempt.
         isTty <- ZIO.attempt(java.lang.System.console() != null).orDie
-        currentTime <- ZIO.attempt(System.currentTimeMillis() / 1000L).orDie
+        currentTime <- Clock.currentTime(TimeUnit.SECONDS)
         state = {
           val home =
-            Option(env.get("HOME"))
+            homeEnv
               .filter(_.nonEmpty)
-              .orElse(Option(java.lang.System.getProperty("user.home")))
+              .orElse(userHomeProp)
               .getOrElse("/")
 
           val now =
-            Option(env.get("TABBY_NOW"))
+            tabbyNowEnv
               .flatMap(value => Try(value.toLong).toOption)
               .getOrElse(currentTime)
 
-          val noColorEnv = Option(env.get("NO_COLOR")).exists(_.nonEmpty)
-          val color = !options.noColor && !noColorEnv && isTty
+          val color = !options.noColor && !noColorEnv.exists(_.nonEmpty) && isTty
 
           ShellState(
             cwd = cwd,
@@ -192,7 +208,7 @@ object Main extends ZIOAppDefault {
     printOut(Render.output(value, opts))
 
   private def printOut(text: String): UIO[Unit] =
-    ZIO.attemptBlocking(System.out.print(text)).orDie
+    Console.print(text).orDie
 
   private def printError(color: Boolean, message: String): UIO[Unit] = {
     val messageWithPrefix = s"✗ $message"
@@ -206,7 +222,7 @@ object Main extends ZIOAppDefault {
     val styled =
       if (color && !message.startsWith(esc)) s"$esc[1;31m$message$esc[0m"
       else message
-    ZIO.attemptBlocking(System.err.println(styled)).orDie
+    Console.printLineError(styled).orDie
   }
 
   private def repl(initialState: ShellState, opts: RenderOpts): UIO[ExitCode] = {
@@ -316,37 +332,35 @@ object Main extends ZIOAppDefault {
       }
     }.ignore
 
-  private def findBannerPath(state: ShellState): Option[Path] = {
-    val fromEnv: Option[Path] =
-      Option(java.lang.System.getenv("TABBY_PROJECT_ROOT"))
-        .map(root => Paths.get(root).resolve("banner.txt"))
-        .filter(Files.exists(_))
+  private def findBannerPath(state: ShellState): UIO[Option[Path]] =
+    ZSystem.env("TABBY_PROJECT_ROOT").orDie.map { envRoot =>
+      val fromEnv: Option[Path] =
+        envRoot
+          .map(root => Paths.get(root).resolve("banner.txt"))
+          .filter(Files.exists(_))
 
-    def searchUp(start: Path): Option[Path] = {
-      if (start == null) None
-      else {
-        val candidate = start.resolve("banner.txt")
-        if (Files.exists(candidate)) Some(candidate)
-        else searchUp(start.getParent)
+      def searchUp(start: Path): Option[Path] = {
+        if (start == null) None
+        else {
+          val candidate = start.resolve("banner.txt")
+          if (Files.exists(candidate)) Some(candidate)
+          else searchUp(start.getParent)
+        }
       }
+
+      fromEnv.orElse(searchUp(Paths.get(state.cwd)))
     }
 
-    fromEnv.orElse(searchUp(Paths.get(state.cwd)))
-  }
-
   private def printBanner(state: ShellState): UIO[Unit] =
-    ZIO
-      .attemptBlocking(findBannerPath(state))
-      .orDie
-      .flatMap {
-        case Some(path) =>
-          ZIO
-            .attemptBlocking(new String(Files.readAllBytes(path), StandardCharsets.UTF_8))
-            .orDie
-            .flatMap(content => printOut(content))
-        case None =>
-          ZIO.unit
-      }
+    findBannerPath(state).flatMap {
+      case Some(path) =>
+        ZIO
+          .attemptBlocking(new String(Files.readAllBytes(path), StandardCharsets.UTF_8))
+          .orDie
+          .flatMap(content => printOut(content))
+      case None =>
+        ZIO.unit
+    }
 
   private def goodbye(color: Boolean): UIO[Unit] = {
     val message = "goodbye."

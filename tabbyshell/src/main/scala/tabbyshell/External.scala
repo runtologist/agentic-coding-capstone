@@ -1,6 +1,6 @@
 package tabbyshell
 
-import zio.{Console => ZConsole, IO, Task, UIO, ZIO}
+import zio.{Console => ZConsole, IO, System => ZSystem, Task, UIO, ZIO}
 
 import java.io.File
 import java.net.URI
@@ -41,13 +41,14 @@ object External {
       stdout: String,
       state: ShellState
   ): IO[TabbyError, Value] = {
-    ZIO
-      .attempt(java.lang.System.getenv())
-      .orDie
-      .flatMap { env =>
-        val disabled = Option(env.get("TABBY_DISABLE_AI")).exists(_.nonEmpty)
-        val apiKey = Option(env.get("OPENROUTER_API_KEY")).filter(_.nonEmpty)
-        val baseUrl = Option(env.get("OPENROUTER_BASE_URL")).filter(_.nonEmpty)
+    for {
+      disabledEnv <- ZSystem.env("TABBY_DISABLE_AI").orDie
+      apiKeyEnv <- ZSystem.env("OPENROUTER_API_KEY").orDie
+      baseUrlEnv <- ZSystem.env("OPENROUTER_BASE_URL").orDie
+      value <- {
+        val disabled = disabledEnv.exists(_.nonEmpty)
+        val apiKey = apiKeyEnv.filter(_.nonEmpty)
+        val baseUrl = baseUrlEnv.filter(_.nonEmpty)
 
         if (disabled) {
           fallback(stdout, "disabled", state.color)
@@ -61,6 +62,7 @@ object External {
           }
         }
       }
+    } yield value
   }
 
   private def callAi(

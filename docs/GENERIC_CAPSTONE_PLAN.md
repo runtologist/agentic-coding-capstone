@@ -145,3 +145,21 @@ Findings from building TabbyShell with Scala 3.3.8 + ZIO 2.1.26 on Java 25 LTS:
    `Value`/`TabbyError` ADTs with only one integration fix needed
    (exit-code propagation). For Snap, freeze `Model`/error ADT and the
    CLI contract before fanning out.
+9. **Idiomatic ZIO side effects (mandatory style rule):**
+   - stdout: `zio.Console.print` / `Console.printLine` — never
+     `System.out.print*`, not even wrapped in `ZIO.attempt*`.
+   - stderr: `zio.Console.printError` / `Console.printLineError` — never
+     `System.err.print*`.
+   - env vars: `zio.System.env("NAME")` / `zio.System.property("NAME")`
+     — never `java.lang.System.getenv()` / `getProperty`.
+   - time: `zio.Clock.currentTime(TimeUnit.SECONDS)` — never
+     `System.currentTimeMillis()` inside app logic.
+   - Allowed raw exceptions, each with an inline comment: TTY detection
+     (`java.lang.System.console()`) and full-stdin reads
+     (`scala.io.Source.stdin`) — ZIO has no equivalent; keep them inside
+     `ZIO.attemptBlocking` and map errors into the domain error ADT.
+   - Blocking file/process/network I/O stays in `ZIO.attemptBlocking`,
+     always `mapError`d into the sealed error ADT (TabbyError pattern).
+   - Verification command to enforce this in review:
+     `grep -rn "System\.\(out\|err\|exit\)\|println(" src/main/scala` must
+     return only the documented exceptions.
