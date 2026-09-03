@@ -17,8 +17,7 @@ object TabbyError {
   final case class MissingArg(command: String, argument: String)
       extends TabbyError(s"$command: missing required argument: $argument")
 
-  final case class BadArg(command: String, detail: String)
-      extends TabbyError(s"$command: $detail")
+  final case class BadArg(command: String, detail: String) extends TabbyError(s"$command: $detail")
 
   final case class IoError(command: String, osMessage: String)
       extends TabbyError(s"$command: $osMessage")

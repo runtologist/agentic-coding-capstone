@@ -16,9 +16,7 @@ enum Value {
 object Value {
   import Value.*
 
-  sealed abstract class ConstructionError(val message: String)
-      extends Product
-      with Serializable
+  sealed abstract class ConstructionError(val message: String) extends Product with Serializable
 
   object ConstructionError {
     final case class DuplicateKey(key: String)

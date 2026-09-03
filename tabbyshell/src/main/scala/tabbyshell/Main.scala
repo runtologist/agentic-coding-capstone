@@ -188,12 +188,9 @@ object Main extends ZIOAppDefault {
 
   private def readScript(target: String): IO[TabbyError, String] = {
     if (target == "-") {
-      ZIO
-        .attemptBlocking {
-          val source = scala.io.Source.stdin
-          try source.mkString
-          finally source.close()
-        }
+      // Idiomatic ZIO: read stdin through the Console service rather than
+      // touching scala.io.Source.stdin inside a blocking attempt.
+      readAllStdin
         .mapError(e => TabbyError.IoError("eval-file", ioMessage(e)))
     } else {
       ZIO
@@ -202,6 +199,23 @@ object Main extends ZIOAppDefault {
         )
         .mapError(e => TabbyError.IoError("eval-file", ioMessage(e)))
     }
+  }
+
+  /** Reads all of stdin via the ZIO Console service, line by line. ZIO's `Console.readLine` signals
+    * end-of-input by failing with `java.io.EOFException` (rather than returning `null`), so that
+    * typed failure is treated as the normal end of the stream. Lines are rejoined with newlines so
+    * downstream continuation/comment handling is unchanged.
+    */
+  private def readAllStdin: IO[java.io.IOException, String] = {
+    def loop(acc: List[String]): IO[java.io.IOException, List[String]] =
+      Console.readLine
+        .map(line => Option(line))
+        .catchSome { case _: java.io.EOFException => ZIO.succeed(None) }
+        .flatMap {
+          case None       => ZIO.succeed(acc.reverse)
+          case Some(line) => loop(line :: acc)
+        }
+    loop(Nil).map(_.mkString("\n"))
   }
 
   private def printValue(value: Value, opts: RenderOpts): UIO[Unit] =
@@ -297,8 +311,13 @@ object Main extends ZIOAppDefault {
 
   private def readLogicalLine(initialPrompt: String): UIO[Option[String]] = {
     def loop(prompt: String, buffer: String): UIO[Option[String]] =
-      ZIO
-        .attemptBlocking(Option(scala.io.StdIn.readLine(prompt)))
+      // Idiomatic ZIO: use the Console service's readLine (which prints the
+      // prompt) instead of scala.io.StdIn.readLine. ZIO signals end-of-input by
+      // failing with java.io.EOFException, which is mapped to None (EOF) here.
+      Console
+        .readLine(prompt)
+        .map(line => Option(line))
+        .catchSome { case _: java.io.EOFException => ZIO.succeed(None) }
         .orDie
         .flatMap {
           case None =>
