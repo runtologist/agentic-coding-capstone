@@ -118,7 +118,13 @@ object Render {
     val d = doy - (153L * mp + 2L) / 5L + 1L
     val m = if (mp < 10L) mp + 3L else mp - 9L
     if (m <= 2L) y += 1L
-    f"$y%04d-$m%02d-$d%02d"
+    String.format(
+      Locale.ROOT,
+      "%04d-%02d-%02d",
+      java.lang.Long.valueOf(y),
+      java.lang.Long.valueOf(m),
+      java.lang.Long.valueOf(d)
+    )
   }
 
   private def renderList(items: List[Value], opts: RenderOpts): String = {
