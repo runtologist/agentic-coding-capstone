@@ -266,6 +266,13 @@ object Executor {
             stringFromArg("select", "column", arg).map(acc :+ _)
           }
         }
+        // Requesting the same column twice would violate the table invariant
+        // (unique columns) enforced by Value.tableTrusted, so reject it as a
+        // typed user error instead of letting the constructor throw.
+        _ <- firstDuplicate(columns) match {
+          case Some(column) => Left(TabbyError.BadArg("select", s"duplicate column: $column"))
+          case None         => Right(())
+        }
         table <- asTable("select", input)
         indices <- columns.foldLeft[Either[TabbyError, List[Int]]](Right(Nil)) { (accE, column) =>
           accE.flatMap { acc =>
@@ -284,6 +291,16 @@ object Executor {
       ZIO.fromEither(result)
     }
   }
+
+  /** First element that repeats an earlier element (scan order). */
+  private def firstDuplicate[A](items: List[A]): Option[A] =
+    items
+      .foldLeft((Set.empty[A], Option.empty[A])) { case ((seen, duplicate), item) =>
+        if (duplicate.isDefined) (seen, duplicate)
+        else if (seen(item)) (seen, Some(item))
+        else (seen + item, None)
+      }
+      ._2
 
   private def sortBy(args: List[Arg], input: Value): IO[TabbyError, Value] = {
     val reverse = hasFlag(args, "r", "reverse")

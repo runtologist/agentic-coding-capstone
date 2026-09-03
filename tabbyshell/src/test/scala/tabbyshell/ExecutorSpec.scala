@@ -163,6 +163,42 @@ object ExecutorSpec extends ZIOSpecDefault {
           )
         )
       }
+    ),
+    suite("select")(
+      test("rejects duplicate requested columns with BadArg") {
+        for {
+          result <- runWithFile("people.json", peopleJson, p => s"open \"$p\" | select name name")
+        } yield assertTrue(
+          result == Left(TabbyError.BadArg("select", "duplicate column: name"))
+        )
+      },
+      test("first duplicate in argument order wins") {
+        for {
+          result <- runWithFile(
+            "people.json",
+            peopleJson,
+            p => s"open \"$p\" | select age name age"
+          )
+        } yield assertTrue(
+          result == Left(TabbyError.BadArg("select", "duplicate column: age"))
+        )
+      },
+      test("selects requested columns in the requested order") {
+        for {
+          result <- runWithFile("people.json", peopleJson, p => s"open \"$p\" | select age name")
+        } yield result match {
+          case Right(VTable(columns, rows)) =>
+            assertTrue(
+              columns == List("age", "name"),
+              rows == List(
+                List(VInt(30L), VStr("Alice")),
+                List(VInt(25L), VStr("Bob")),
+                List(VInt(40L), VStr("Carol"))
+              )
+            )
+          case _ => assertTrue(false)
+        }
+      }
     )
   )
 }
