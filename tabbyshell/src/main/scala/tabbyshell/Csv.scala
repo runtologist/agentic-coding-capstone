@@ -8,16 +8,11 @@ object Csv {
     val normalized = if (content.startsWith("\uFEFF")) content.drop(1) else content
     val rows = parseRows(normalized)
     if (rows.isEmpty) {
-      Right(Value.VTable(List.empty, List.empty))
+      Right(Value.tableTrusted(List.empty, List.empty))
     } else {
       val columns = rows.head
-      val dataRows = rows.drop(1).map { row =>
-        val paddedOrTruncated = columns.indices.map { i =>
-          row.lift(i).getOrElse("")
-        }.toList
-        paddedOrTruncated.map(Value.VStr.apply)
-      }
-      Right(Value.VTable(columns, dataRows))
+      val dataRows = rows.drop(1).map(_.map(Value.VStr.apply))
+      Value.table(columns, dataRows).left.map(_.message)
     }
   }
 
@@ -35,6 +30,7 @@ object Csv {
     val fields = ListBuffer.empty[String]
     val field = new StringBuilder
     var inQuotes = false
+    var rowHasContent = false
     var i = 0
 
     def endField(): Unit = {
@@ -43,16 +39,19 @@ object Csv {
     }
 
     def endRow(): Unit = {
-      endField()
-      if (fields.nonEmpty || field.nonEmpty) {
+      if (rowHasContent) {
+        endField()
         rows += fields.toList
       }
       fields.clear()
+      field.clear()
+      rowHasContent = false
     }
 
     while (i < content.length) {
       val c = content.charAt(i)
       if (inQuotes) {
+        rowHasContent = true
         if (c == '"') {
           if (i + 1 < content.length && content.charAt(i + 1) == '"') {
             field.append('"')
@@ -69,8 +68,10 @@ object Csv {
         c match {
           case '"' =>
             inQuotes = true
+            rowHasContent = true
             i += 1
           case ',' =>
+            rowHasContent = true
             endField()
             i += 1
           case '\n' =>
@@ -81,17 +82,20 @@ object Csv {
             if (i + 1 < content.length && content.charAt(i + 1) == '\n') i += 2
             else i += 1
           case _ =>
+            rowHasContent = true
             field.append(c)
             i += 1
         }
       }
     }
 
-    if (field.nonEmpty || fields.nonEmpty) {
-      endRow()
+    // Flush any final row that lacks a trailing newline.
+    if (rowHasContent) {
+      endField()
+      rows += fields.toList
     }
 
-    rows.toList.filter(_.nonEmpty)
+    rows.toList
   }
 
   private def cellText(value: Value): String = value match {
