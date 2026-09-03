@@ -56,7 +56,7 @@ object Json {
       case VRecord(fields) => writeObject(fields, indent, sb)
       case VTable(columns, rows) =>
         val records = rows.map { row =>
-          VRecord(columns.zip(row))
+          Value.recordTrusted(columns.zip(row))
         }
         writeArray(records, indent, sb)
     }
@@ -148,7 +148,7 @@ object Json {
       skipWhitespace()
       if (peekChar().contains('}')) {
         pos += 1
-        return VRecord(Nil)
+        return Value.recordTrusted(Nil)
       }
       val fields = ListBuffer.empty[(String, Value)]
       var done = false
@@ -174,7 +174,7 @@ object Json {
             error("expected ',' or '}' in object")
         }
       }
-      VRecord(fields.toList)
+      Value.record(fields.toList).fold(e => error(e.message), identity)
     }
 
     private def parseArray(): Value = {
