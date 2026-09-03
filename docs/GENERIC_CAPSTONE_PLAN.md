@@ -27,51 +27,83 @@ Every task is "done" only when ALL of these pass:
   - Ambiguities and untested behaviors (explicitly listed).
 - Freeze the contract before implementation starts. Changes go through review.
 
-## 2. Architecture (Scala 3 + ZIO)
+## 2. Architecture (derived, not prescribed)
 
-Recommended module split (adapt to the actual capstone):
+Do not start from a fixed module list. Derive the architecture from the
+project's specification, public tests, and delivery interface. The
+TabbyShell CLI-shaped split is preserved as a case study in
+[`examples/tabbyshell-architecture.md`](examples/tabbyshell-architecture.md);
+it is an example, not a default template. Do not copy it unless the project
+actually has that shape.
 
-| Module       | Responsibility                              |
-|--------------|---------------------------------------------|
-| `Model.scala`| Pure ADTs for domain values + typed errors  |
-| `Parser.scala`| Input -> AST, pure, fully unit-testable    |
-| `Core.scala` | Pure logic (evaluation, merging, etc.)      |
-| `Effects.scala`| ZIO wrappers for FS/process/HTTP/clock    |
-| `Render.scala`| Pure output formatting (byte-exact)       |
-| `Cli.scala`  | Arg parsing, mode dispatch                  |
-| `Main.scala` | ZIOAppDefault entrypoint, exit codes        |
+Required architectural properties (every capstone):
 
-Rules:
-- Parse external input at the boundary; typed domain after that.
-- No raw `println`, `sys.exit`, `System.getenv`, file/network IO outside ZIO.
-- Errors are a sealed ADT, never raw strings/exceptions in domain code.
-- Renderer/logic must be pure: `now`, `cwd`, `color` come from state/config.
+1. External inputs (CLI args, files, env vars, network payloads) are parsed
+   at the boundary into typed domain values; no raw strings with implicit
+   assumptions flow through the domain.
+2. Domain logic is pure and unit-testable; impurity is pushed to the edges.
+3. Side effects live behind explicit ZIO interfaces (filesystem, process,
+   HTTP, clock, environment) and are mapped into the sealed error ADT.
+4. Output formatting is a pure function whenever the spec demands exact or
+   byte-identical output.
+5. Time, environment, randomness, and workspace paths are injected (state or
+   services), never read deep inside pure logic.
+6. Errors are a sealed ADT with stable, spec-conformant messages; never raw
+   strings or generic exceptions in domain code.
+7. Each module is independently implementable and testable, with frozen
+   interfaces, so parallel subagents never share file ownership.
+
+Idiomatic ZIO rules (see memory: `idiomatic-zio-patterns`):
+- No raw side effects outside ZIO: `zio.Console` for stdout/stderr,
+  `zio.System` for env/properties, `zio.Clock` for time, `ZIOApp#exit`
+  for process exit codes.
+
+Anti-patterns:
+- Creating Parser/Render/Cli modules when the project has no textual input
+  language, byte-exact text output, or CLI surface.
+- Copying TabbyShell's module split into a differently shaped project.
+- Choosing a structure before reading the spec and every public test.
 
 ## 3. Parallel subagent strategy
 
 Parallelism is only safe when modules have fixed interfaces.
 
 ### Phase A — Foundation (sequential, one agent)
-- Scaffold build, CI script, `Model` + error ADT + shared interfaces.
+- Scaffold build, CI script, domain model + error ADT + shared interfaces.
 - Freeze these as the "contract files" other agents code against.
 
-### Phase B — Parallel implementation (worktree-isolated)
-Each subagent gets ONE packet and must not touch shared files:
-- Agent 1: Parser (+ parser unit tests)
-- Agent 2: Renderer/output formatting (+ golden unit tests)
-- Agent 3: Core logic / commands (+ unit tests)
-- Agent 4: External effects (FS/process/HTTP) behind ZIO interfaces (+ tests)
+### Phase B — Architecture proposal (sequential, one architect)
+
+Before any implementation packet is written:
+
+1. Identify the project's delivery shape (CLI tool, library, service, batch
+   processor, TUI, ...) from the spec and the acceptance harness.
+2. Propose the domain model and error ADT.
+3. Propose modules mapped to the project's domain — not to a template —
+   each with exclusive file ownership and frozen interfaces.
+4. Identify determinism seams (time/env/IO) and the test strategy per module.
+5. Write `docs/<project>/ARCHITECTURE.md`: module map, interfaces, and the
+   file-ownership table.
+6. Have it reviewed (human or oracle subagent) before parallel work starts.
+
+Only after approval are Phase C packets created, each referencing the frozen
+contracts in `docs/<project>/ARCHITECTURE.md`.
+
+### Phase C — Parallel implementation (worktree-isolated)
+Each subagent gets ONE packet derived from the approved architecture: one
+module (or one cohesive module group), exclusive file ownership, and the
+frozen interfaces to code against. Packets never prescribe shared modules.
 
 Packet template (see `docs/TASK_PACKET_TEMPLATE.md`):
 - Goal, exact spec sections, allowed files, interfaces to implement,
   definition of done (tests + commands + evidence), out-of-scope list.
 
-### Phase C — Integration (sequential, one integrator)
+### Phase D — Integration (sequential, one integrator)
 - Merge one branch at a time into `develop`.
 - Run full quality gates after EACH merge, never batch merges.
 - Fix integration breakage before merging the next branch.
 
-### Phase D — Adversarial review (parallel lanes, sequential fixes)
+### Phase E — Adversarial review (parallel lanes, sequential fixes)
 
 Run after the official acceptance suite is green and before declaring the
 capstone passed. Launch parallel review lanes; each lane produces a report

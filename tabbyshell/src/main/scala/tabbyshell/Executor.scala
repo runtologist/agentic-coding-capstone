@@ -226,8 +226,8 @@ object Executor {
   ): Either[TabbyError, Boolean] = {
     val equalityOnly = op == "==" || op == "!="
     val comparison: Either[TabbyError, Int] = (cell, literal) match {
-      case (a, b) if numericDouble(a).isDefined && numericDouble(b).isDefined =>
-        Right(java.lang.Double.compare(numericDouble(a).get, numericDouble(b).get))
+      case (a, b) if numericValue(a).isDefined && numericValue(b).isDefined =>
+        Right(compareNumeric(a, b))
       case (VStr(a), VStr(b)) =>
         Right(a.compareTo(b))
       case (VDate(a), VDate(b)) =>
@@ -336,18 +336,18 @@ object Executor {
         val sorted = indexed.sortWith { case ((rowA, indexA), (rowB, indexB)) =>
           val a = rowA.lift(columnIndex).getOrElse(VNull)
           val b = rowB.lift(columnIndex).getOrElse(VNull)
-          val rawComparison = compareSortValues(a, b, firstCategory)
-          val comparison = if (reverse) -rawComparison else rawComparison
+          val comparison = compareSortValues(a, b, firstCategory)
           if (comparison != 0) comparison < 0
           else indexA < indexB
         }
-        Right(sorted.map(_._1))
+        val ordered = if (reverse) sorted.reverse else sorted
+        Right(ordered.map(_._1))
     }
   }
 
   private def compareSortValues(a: Value, b: Value, category: Int): Int = category match {
     case 0 =>
-      java.lang.Double.compare(numericDouble(a).getOrElse(0.0d), numericDouble(b).getOrElse(0.0d))
+      compareNumeric(a, b)
     case 1 =>
       (a, b) match {
         case (VStr(left), VStr(right)) => left.compareTo(right)
@@ -389,7 +389,8 @@ object Executor {
         case VTable(columns, rows) =>
           countOpt match {
             case None =>
-              rows.headOption match {
+              val chosen = if (takeFirst) rows.headOption else rows.lastOption
+              chosen match {
                 case Some(row) => Right(VRecord(columns.zip(row)))
                 case None      => Left(TabbyError.BadArg(command, "input is empty"))
               }
@@ -404,7 +405,8 @@ object Executor {
         case VList(items) =>
           countOpt match {
             case None =>
-              items.headOption match {
+              val chosen = if (takeFirst) items.headOption else items.lastOption
+              chosen match {
                 case Some(item) => Right(item)
                 case None       => Left(TabbyError.BadArg(command, "input is empty"))
               }
@@ -547,11 +549,23 @@ object Executor {
     case Literal.LFilesize(v)  => VFilesize(v)
   }
 
-  private def numericDouble(value: Value): Option[Double] = value match {
-    case VInt(n)      => Some(n.toDouble)
-    case VFloat(d)    => Some(d)
-    case VFilesize(b) => Some(b.toDouble)
+  private def numericValue(value: Value): Option[BigDecimal] = value match {
+    case VInt(n)      => Some(BigDecimal(n))
+    case VFloat(d)    => Some(BigDecimal(d))
+    case VFilesize(b) => Some(BigDecimal(b))
     case _            => None
+  }
+
+  private def compareNumeric(a: Value, b: Value): Int = (a, b) match {
+    case (VInt(x), VInt(y))           => java.lang.Long.compare(x, y)
+    case (VFilesize(x), VFilesize(y)) => java.lang.Long.compare(x, y)
+    case (VInt(x), VFilesize(y))      => java.lang.Long.compare(x, y)
+    case (VFilesize(x), VInt(y))      => java.lang.Long.compare(x, y)
+    case _ =>
+      (numericValue(a), numericValue(b)) match {
+        case (Some(x), Some(y)) => x.compare(y)
+        case _                  => 0
+      }
   }
 
   private def asTable(command: String, input: Value): Either[TabbyError, VTable] = input match {
