@@ -71,10 +71,34 @@ Packet template (see `docs/TASK_PACKET_TEMPLATE.md`):
 - Run full quality gates after EACH merge, never batch merges.
 - Fix integration breakage before merging the next branch.
 
-### Phase D — Hardening (parallel review, sequential fixes)
-- Reviewer subagents (read-only) audit: overfitting to tests, hidden env
-  assumptions, network calls, error-message exactness.
-- Fixes are applied sequentially by one writer.
+### Phase D — Adversarial review (parallel lanes, sequential fixes)
+
+Run after the official acceptance suite is green and before declaring the
+capstone passed. Launch parallel review lanes; each lane produces a report
+under `reviews/<project>/`, then one writer applies fixes sequentially and
+re-runs the full gate suite.
+
+1. **Spec-compliance review** — compare implementation against the spec
+   clause by clause: exact CLI behavior, error message formats, edge cases,
+   and untested but specified behavior.
+2. **Overfitting / environment review** — look for behavior tuned only to
+   public tests, hidden cwd/HOME/timezone/locale/JDK assumptions, stale jar
+   naming issues, and accidental network access.
+3. **Code/process quality review** — inspect ZIO idiom, ADT/error-channel
+   design, purity boundaries, test coverage gaps, formatting/lint strictness,
+   commit hygiene, and whether the task-packet process was actually followed.
+4. **Dynamic adversarial probing** — run the built artifact against inputs not
+   covered by the public suite: missing files, malformed input, bad escapes,
+   boundary dates/times, truncation, unusual Unicode, empty/large inputs,
+   external-command failures, `--eval`, and REPL smoke tests.
+
+Review output requirements:
+- Every finding must be ranked: blocker / major / minor / nit.
+- Every finding must include evidence: file/line, spec clause or test name,
+  reproduction command, and proposed fix.
+- Blockers and majors must be fixed and re-verified before the branch is
+  considered green.
+- Reviewers must not edit production code; only reports are written.
 
 ## 4. Git workflow
 
