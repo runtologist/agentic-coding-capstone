@@ -39,44 +39,33 @@ object Parser {
     case TPipe(pos: Int)
   }
 
-  def joinContinuations(script: String): String = {
+  /** Resolves line continuations (spec §3.1 / §7.3).
+    *
+    * A physical line continues only when a backslash is the very last character (immediately before
+    * the newline — no trailing-whitespace tolerance). The backslash and the physical newline are
+    * dropped; a single '\n' is kept in the logical buffer so the tokenizer can treat it as
+    * whitespace.
+    *
+    * Returns one element per logical pipeline.
+    */
+  def joinContinuations(script: String): List[String] = {
     val lines = script.split("\n", -1)
-    val out = new StringBuilder
+    val out = ListBuffer.empty[String]
+    val buffer = new StringBuilder
     var i = 0
     while (i < lines.length) {
-      val logical = new StringBuilder
-      var current = lines(i)
-      var continue = true
-      while (continue && endsWithContinuation(current)) {
-        logical.append(stripTrailingContinuation(current))
-        i += 1
-        if (i < lines.length) {
-          logical.append(' ')
-          current = lines(i)
-        } else {
-          continue = false
-        }
+      val line = lines(i)
+      if (line.endsWith("\\")) {
+        buffer.append(line.dropRight(1)).append('\n')
+      } else {
+        buffer.append(line)
+        out += buffer.toString
+        buffer.clear()
       }
-      if (i < lines.length) {
-        logical.append(current)
-        i += 1
-      }
-      out.append(logical.toString).append('\n')
+      i += 1
     }
-    out.toString
-  }
-
-  private def endsWithContinuation(line: String): Boolean = {
-    var j = line.length - 1
-    while (j >= 0 && (line.charAt(j) == ' ' || line.charAt(j) == '\t')) j -= 1
-    j >= 0 && line.charAt(j) == '\\'
-  }
-
-  private def stripTrailingContinuation(line: String): String = {
-    var j = line.length - 1
-    while (j >= 0 && (line.charAt(j) == ' ' || line.charAt(j) == '\t')) j -= 1
-    if (j >= 0 && line.charAt(j) == '\\') line.substring(0, j)
-    else line
+    if (buffer.nonEmpty) out += buffer.toString
+    out.toList
   }
 
   def parseLine(line: String): Either[TabbyError, Option[Pipeline]] = {
@@ -111,10 +100,10 @@ object Parser {
       val tokens = ListBuffer.empty[Token]
       while (idx < line.length) {
         val c = currentChar
-        if (c == ' ' || c == '\t') {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
           idx += 1
         } else if (c == '#') {
-          idx = line.length
+          while (idx < line.length && line.charAt(idx) != '\n') idx += 1
         } else if (c == '|') {
           tokens += Token.TPipe(idx)
           idx += 1
@@ -143,7 +132,7 @@ object Parser {
           val pos = idx
           idx += 1
           tokens += Token.TDash(pos)
-        } else if (c.isDigit || (c == '.' && charAt(idx + 1).exists(_.isDigit))) {
+        } else if (c.isDigit) {
           parseNumber() match {
             case Left(err)    => return Left(err)
             case Right(token) => tokens += token
@@ -288,7 +277,7 @@ object Parser {
         parseString().map { case (s, _) => Literal.LStr(s) }
       } else if (c == '-' && charAt(idx + 1).exists(_.isDigit)) {
         parseNumber().map(numberToLiteral)
-      } else if (c.isDigit || (c == '.' && charAt(idx + 1).exists(_.isDigit))) {
+      } else if (c.isDigit) {
         parseNumber().map(numberToLiteral)
       } else if (isWordStart(c)) {
         val start = idx
@@ -353,63 +342,63 @@ object Parser {
         if (pos >= tokens.length) {
           return fail("expected command", line.length)
         }
-        tokens(pos) match {
+        val commandName: String = tokens(pos) match {
           case Token.TWord(name, _) =>
-            pos += 1
-            val args = ListBuffer.empty[Arg]
-            var done = false
-            while (!done && pos < tokens.length) {
-              tokens(pos) match {
-                case Token.TPipe(_) =>
-                  done = true
-                case Token.TWord(s, _) =>
-                  args += Arg.Bare(s); pos += 1
-                case Token.TStr(s, _) =>
-                  args += Arg.Lit(Literal.LStr(s)); pos += 1
-                case Token.TInt(v, _) =>
-                  args += Arg.Lit(Literal.LInt(v)); pos += 1
-                case Token.TFloat(v, _) =>
-                  args += Arg.Lit(Literal.LFloat(v)); pos += 1
-                case Token.TFilesize(v, _) =>
-                  args += Arg.Lit(Literal.LFilesize(v)); pos += 1
-                case Token.TBool(v, _) =>
-                  args += Arg.Lit(Literal.LBool(v)); pos += 1
-                case Token.TNull(_) =>
-                  args += Arg.Lit(Literal.LNull); pos += 1
-                case Token.TLongFlag(name, value, _) =>
-                  args += Arg.Flag(name, value); pos += 1
-                case Token.TShortFlag(name, _) =>
-                  args += Arg.Flag(name.toString, None); pos += 1
-                case Token.TOp(op, _) =>
-                  args += Arg.Op(op); pos += 1
-                case Token.TDash(_) =>
-                  args += Arg.Dash; pos += 1
-              }
-            }
-            Right(Command(name, args.toList))
+            pos += 1; name
+          case Token.TBool(value, _) =>
+            pos += 1; if (value) "true" else "false"
+          case Token.TNull(_) =>
+            pos += 1; "null"
           case Token.TPipe(p) =>
-            fail("expected command before '|'", p)
+            return fail("expected command before '|'", p)
           case Token.TStr(_, p) =>
-            fail("expected command name", p)
+            return fail("expected command name", p)
           case Token.TInt(_, p) =>
-            fail("expected command name", p)
+            return fail("expected command name", p)
           case Token.TFloat(_, p) =>
-            fail("expected command name", p)
+            return fail("expected command name", p)
           case Token.TFilesize(_, p) =>
-            fail("expected command name", p)
-          case Token.TBool(_, p) =>
-            fail("expected command name", p)
-          case Token.TNull(p) =>
-            fail("expected command name", p)
+            return fail("expected command name", p)
           case Token.TLongFlag(_, _, p) =>
-            fail("expected command name", p)
+            return fail("expected command name", p)
           case Token.TShortFlag(_, p) =>
-            fail("expected command name", p)
+            return fail("expected command name", p)
           case Token.TOp(_, p) =>
-            fail("expected command name", p)
+            return fail("expected command name", p)
           case Token.TDash(p) =>
-            fail("expected command name", p)
+            return fail("expected command name", p)
         }
+        val args = ListBuffer.empty[Arg]
+        var done = false
+        while (!done && pos < tokens.length) {
+          tokens(pos) match {
+            case Token.TPipe(_) =>
+              done = true
+            case Token.TWord(s, _) =>
+              args += Arg.Bare(s); pos += 1
+            case Token.TStr(s, _) =>
+              args += Arg.Lit(Literal.LStr(s)); pos += 1
+            case Token.TInt(v, _) =>
+              args += Arg.Lit(Literal.LInt(v)); pos += 1
+            case Token.TFloat(v, _) =>
+              args += Arg.Lit(Literal.LFloat(v)); pos += 1
+            case Token.TFilesize(v, _) =>
+              args += Arg.Lit(Literal.LFilesize(v)); pos += 1
+            case Token.TBool(v, _) =>
+              args += Arg.Lit(Literal.LBool(v)); pos += 1
+            case Token.TNull(_) =>
+              args += Arg.Lit(Literal.LNull); pos += 1
+            case Token.TLongFlag(name, value, _) =>
+              args += Arg.Flag(name, value); pos += 1
+            case Token.TShortFlag(name, _) =>
+              args += Arg.Flag(name.toString, None); pos += 1
+            case Token.TOp(op, _) =>
+              args += Arg.Op(op); pos += 1
+            case Token.TDash(_) =>
+              args += Arg.Dash; pos += 1
+          }
+        }
+        Right(Command(commandName, args.toList))
       }
 
       commands += (parseCommand() match {

@@ -17,7 +17,6 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
 import java.util.concurrent.TimeUnit
 import scala.jdk.CollectionConverters.*
-import scala.util.Try
 
 /** TabbyShell entry point.
   *
@@ -83,66 +82,75 @@ object Main extends ZIOAppDefault {
     if (options.showVersion) {
       printOut(Version.line + "\n").as(ExitCode.success)
     } else {
-      for {
-        homeEnv <- ZSystem.env("HOME").orDie
-        tabbyNowEnv <- ZSystem.env("TABBY_NOW").orDie
-        noColorEnv <- ZSystem.env("NO_COLOR").orDie
-        userHomeProp <- ZSystem.property("user.home").orDie
-        cwd <- ZIO.attempt(Paths.get("").toAbsolutePath.normalize.toString).orDie
-        // ZIO has no built-in service for TTY detection; this raw call is
-        // deliberate and remains wrapped in ZIO.attempt.
-        isTty <- ZIO.attempt(java.lang.System.console() != null).orDie
-        currentTime <- Clock.currentTime(TimeUnit.SECONDS)
-        state = {
-          val home =
-            homeEnv
-              .filter(_.nonEmpty)
-              .orElse(userHomeProp)
-              .getOrElse("/")
+      setupState(options).either.flatMap {
+        case Left(error) =>
+          printErrorLine(color = false, error.message).as(ExitCode(2))
+        case Right((state, renderOpts, isTty)) =>
+          (options.eval, options.evalFile) match {
+            case (Some(script), _) =>
+              // Spec §8: --eval always renders without color.
+              runScript(script, state, renderOpts.copy(color = false))
 
-          val now =
-            tabbyNowEnv
-              .flatMap(value => Try(value.toLong).toOption)
-              .getOrElse(currentTime)
-
-          val color = !options.noColor && !noColorEnv.exists(_.nonEmpty) && isTty
-
-          ShellState(
-            cwd = cwd,
-            prevCwd = None,
-            home = home,
-            now = now,
-            color = color
-          )
-        }
-        renderOpts = RenderOpts(color = state.color, maxColWidth = 40, now = state.now)
-        exitCode <- (options.eval, options.evalFile) match {
-          case (Some(script), _) =>
-            runScript(script, state, renderOpts)
-
-          case (None, Some(target)) =>
-            readScript(target).either.flatMap {
-              case Left(error) =>
-                printError(renderOpts.color, error.message).as(ExitCode(1))
-              case Right(script) =>
-                runScript(script, state, renderOpts)
-            }
-
-          case (None, None) =>
-            if (options.interactive || isTty) {
-              repl(state, renderOpts)
-            } else {
-              readScript("-").either.flatMap {
+            case (None, Some(target)) =>
+              readScript(target).either.flatMap {
                 case Left(error) =>
                   printError(renderOpts.color, error.message).as(ExitCode(1))
                 case Right(script) =>
                   runScript(script, state, renderOpts)
               }
-            }
-        }
-      } yield exitCode
+
+            case (None, None) =>
+              if (options.interactive || isTty) {
+                repl(state, renderOpts)
+              } else {
+                readScript("-").either.flatMap {
+                  case Left(error) =>
+                    printError(renderOpts.color, error.message).as(ExitCode(1))
+                  case Right(script) =>
+                    runScript(script, state, renderOpts)
+                }
+              }
+          }
+      }
     }
   }
+
+  private def setupState(
+      options: CliOptions
+  ): IO[TabbyError, (ShellState, RenderOpts, Boolean)] =
+    for {
+      homeEnv <- ZSystem.env("HOME").orDie
+      tabbyNowEnv <- ZSystem.env("TABBY_NOW").orDie
+      noColorEnv <- ZSystem.env("NO_COLOR").orDie
+      userHomeProp <- ZSystem.property("user.home").orDie
+      cwd <- ZIO.attempt(Paths.get("").toAbsolutePath.normalize.toString).orDie
+      // ZIO has no built-in service for TTY detection; this raw call is
+      // deliberate and remains wrapped in ZIO.attempt.
+      isTty <- ZIO.attempt(java.lang.System.console() != null).orDie
+      currentTime <- Clock.currentTime(TimeUnit.SECONDS)
+      now <- resolveNow(tabbyNowEnv, currentTime)
+      home = homeEnv.filter(_.nonEmpty).orElse(userHomeProp).getOrElse("/")
+      color = !options.noColor && !noColorEnv.exists(_.nonEmpty) && isTty
+      state = ShellState(
+        cwd = cwd,
+        prevCwd = None,
+        home = home,
+        now = now,
+        color = color
+      )
+      renderOpts = RenderOpts(color = state.color, maxColWidth = 40, now = state.now)
+    } yield (state, renderOpts, isTty)
+
+  private def resolveNow(tabbyNowEnv: Option[String], fallback: Long): IO[TabbyError, Long] =
+    tabbyNowEnv match {
+      case None => ZIO.succeed(fallback)
+      case Some(raw) =>
+        raw.trim.toLongOption match {
+          case Some(value) => ZIO.succeed(value)
+          case None =>
+            ZIO.fail(TabbyError.BadArg("TABBY_NOW", s"invalid unix seconds: $raw"))
+        }
+    }
 
   private def runScript(
       script: String,
@@ -150,8 +158,7 @@ object Main extends ZIOAppDefault {
       opts: RenderOpts
   ): UIO[ExitCode] = {
     val normalized = script.replace("\r\n", "\n").replace('\r', '\n')
-    val joined = Parser.joinContinuations(normalized)
-    val lines = joined.split("\n", -1).toList
+    val lines = Parser.joinContinuations(normalized)
 
     def loop(remaining: List[String], state: ShellState): UIO[ExitCode] =
       remaining match {
@@ -296,19 +303,6 @@ object Main extends ZIOAppDefault {
     short + " ❯ "
   }
 
-  private def endsWithContinuation(line: String): Boolean = {
-    var j = line.length - 1
-    while (j >= 0 && (line.charAt(j) == ' ' || line.charAt(j) == '\t')) j -= 1
-    j >= 0 && line.charAt(j) == '\\'
-  }
-
-  private def stripTrailingContinuation(line: String): String = {
-    var j = line.length - 1
-    while (j >= 0 && (line.charAt(j) == ' ' || line.charAt(j) == '\t')) j -= 1
-    if (j >= 0 && line.charAt(j) == '\\') line.substring(0, j)
-    else line
-  }
-
   private def readLogicalLine(initialPrompt: String): UIO[Option[String]] = {
     def loop(prompt: String, buffer: String): UIO[Option[String]] =
       // Idiomatic ZIO: use the Console service's readLine (which prints the
@@ -324,8 +318,10 @@ object Main extends ZIOAppDefault {
             ZIO.succeed(if (buffer.isEmpty) None else Some(buffer))
 
           case Some(line) =>
-            if (endsWithContinuation(line)) {
-              loop("  ", buffer + stripTrailingContinuation(line) + " ")
+            // Spec §7.3: continuation only when the backslash is the very last
+            // character; drop it and keep a newline in the buffer.
+            if (line.endsWith("\\")) {
+              loop("  ", buffer + line.dropRight(1) + "\n")
             } else {
               ZIO.succeed(Some(buffer + line))
             }
@@ -336,7 +332,9 @@ object Main extends ZIOAppDefault {
 
   private def appendHistory(state: ShellState, line: String): UIO[Unit] =
     ZIO.attemptBlocking {
-      val trimmed = line.trim
+      // Logical lines may contain embedded newlines from continuations;
+      // flatten them so the history file stays one-entry-per-line.
+      val trimmed = line.replace('\n', ' ').trim
       if (trimmed.nonEmpty) {
         val path = Paths.get(state.home, ".tabbyshell_history")
         val existing =
