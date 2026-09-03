@@ -4,6 +4,10 @@ This plan is language-agnostic in structure but tuned for our Scala/ZIO
 implementation. It is designed to be executed with parallel subagents while
 keeping one integrator responsible for merging and quality gates.
 
+Use available skills explicitly at each stage (Superpowers and pi-subagents).
+If a named skill is unavailable, follow its written process manually and record
+the fallback in the project ledger.
+
 ## 0. Non-negotiable quality gates
 
 Every task is "done" only when ALL of these pass:
@@ -26,6 +30,9 @@ Every task is "done" only when ALL of these pass:
   - Determinism rules (frozen time, no-color, etc.).
   - Ambiguities and untested behaviors (explicitly listed).
 - Freeze the contract before implementation starts. Changes go through review.
+- Resolve ambiguities with `ask-user`; use `brainstorming` for substantive
+  scope/design choices. Every unresolved ambiguity gets an explicit ruling or a
+  user decision, never a silent assumption.
 
 ## 2. Architecture (derived, not prescribed)
 
@@ -53,6 +60,11 @@ Required architectural properties (every capstone):
 7. Each module is independently implementable and testable, with frozen
    interfaces, so parallel subagents never share file ownership.
 
+Approval gate: before packet writing starts, present the derived architecture,
+error ADT, determinism seams, and file-ownership table using `brainstorming` or
+`ask-user`. For material tradeoffs use `council-mode`; for annotated document
+review use `plannotator`. Do not start Phase C without explicit approval.
+
 Idiomatic ZIO rules (see memory: `idiomatic-zio-patterns`):
 - No raw side effects outside ZIO: `zio.Console` for stdout/stderr,
   `zio.System` for env/properties, `zio.Clock` for time, `ZIOApp#exit`
@@ -64,6 +76,17 @@ Anti-patterns:
 - Copying TabbyShell's module split into a differently shaped project.
 - Choosing a structure before reading the spec and every public test.
 
+## Skills map (by stage)
+
+| Stage | Skills | Use for |
+|---|---|---|
+| Intake / contract | `ask-user`, `brainstorming`, `zio-knowledge`, `zio-http-knowledge` | resolving ambiguities, approving the contract, verifying ZIO/library facts |
+| Architecture / planning | `writing-plans`, `brainstorming`, `council-mode`, `plannotator` | deriving architecture, writing CONTRACT/ARCHITECTURE docs, reviewing material decisions |
+| Foundation / implementation | `subagent-driven-development`, `test-driven-development`, `using-git-worktrees`, `dispatching-parallel-agents`, `pi-subagents` | per-task packets, failing tests first, isolated worktrees, independent lanes |
+| Integration | `finishing-a-development-branch`, `systematic-debugging`, `verification-before-completion` | sequential merges, gate-failure investigation, fresh evidence before claims |
+| Review | `requesting-code-review`, `receiving-code-review`, `pi-subagents` review references | fresh-context review lanes, finding disposition, evidence-based feedback |
+| Fix round | `receiving-code-review`, `dispatching-parallel-agents`, `systematic-debugging`, `verification-before-completion`, `memory-write` | triage findings, parallel worktree fixes, debug failures, record lessons |
+
 ## 3. Parallel subagent strategy
 
 Parallelism is only safe when modules have fixed interfaces.
@@ -71,6 +94,8 @@ Parallelism is only safe when modules have fixed interfaces.
 ### Phase A — Foundation (sequential, one agent)
 - Scaffold build, CI script, domain model + error ADT + shared interfaces.
 - Freeze these as the "contract files" other agents code against.
+- Apply `test-driven-development`: include failing/invariant tests for the
+  shared interfaces as part of the foundation, not after implementation.
 
 ### Phase B — Architecture proposal (sequential, one architect)
 
@@ -84,7 +109,9 @@ Before any implementation packet is written:
 4. Identify determinism seams (time/env/IO) and the test strategy per module.
 5. Write `docs/<project>/ARCHITECTURE.md`: module map, interfaces, and the
    file-ownership table.
-6. Have it reviewed (human or oracle subagent) before parallel work starts.
+6. Obtain explicit review and approval before parallel work starts: human
+   approval via `brainstorming`/`ask-user`; optionally `council-mode` for
+   tradeoffs or `plannotator` for annotated plan review.
 
 Only after approval are Phase C packets created, each referencing the frozen
 contracts in `docs/<project>/ARCHITECTURE.md`.
@@ -94,21 +121,54 @@ Each subagent gets ONE packet derived from the approved architecture: one
 module (or one cohesive module group), exclusive file ownership, and the
 frozen interfaces to code against. Packets never prescribe shared modules.
 
-Packet template (see `docs/TASK_PACKET_TEMPLATE.md`):
-- Goal, exact spec sections, allowed files, interfaces to implement,
-  definition of done (tests + commands + evidence), out-of-scope list.
+Packet preparation:
+
+- Prefer `subagent-driven-development` scripts (`sdd-workspace`, `task-brief`,
+  `review-package`) when available; `docs/TASK_PACKET_TEMPLATE.md` is the
+  capstone-specific fallback.
+- Every packet is a cold-start brief: goal, exact spec sections, allowed files,
+  interfaces to implement, definition of done (tests + commands + evidence),
+  out-of-scope list, and stop/escalation rules.
+- Apply `test-driven-development`: each packet names the failing test(s) or
+  invariant test(s) that must exist before implementation is accepted.
+
+Orchestration:
+
+- Use one async `workflowScript` per wave. Prefer `runs.lanes([...])` for
+  bounded parallel lanes with implement→verify stages; use `runs.all([...])`
+  only for simple independent fanout.
+- Keep one writer per cwd/worktree; reviewers are read-only and fresh-context.
+
+Ledger:
+
+- Maintain `docs/<project>/LEDGER.md` (or `.superpowers/sdd/<plan>/progress.md`
+  when using SDD) recording lanes, branches, commits, gate evidence, rulings,
+  parked findings, and blockers.
+- After compaction or interruption, reconcile the ledger against `git log`,
+  active subagent runs, and `git worktree list` before dispatching anything
+  new; never re-dispatch work already recorded as complete.
 
 ### Phase D — Integration (sequential, one integrator)
 - Merge one branch at a time into `develop`.
 - Run full quality gates after EACH merge, never batch merges.
 - Fix integration breakage before merging the next branch.
+- Use `finishing-a-development-branch` for the verify → options → cleanup flow.
+- Use `systematic-debugging` for any gate or integration failure: root cause
+  before patching.
+- Use `verification-before-completion`: no merge is "green" without fresh gate
+  output for the exact merged HEAD.
 
-### Phase E — Adversarial review (parallel lanes, sequential fixes)
+### Phase E — Adversarial review (parallel lanes, parent triage)
 
 Run after the official acceptance suite is green and before declaring the
-capstone passed. Launch parallel review lanes; each lane produces a report
-under `reviews/<project>/`, then one writer applies fixes sequentially and
-re-runs the full gate suite.
+capstone passed. Launch parallel read-only review lanes with fresh context and
+distinct contracts; each lane produces a report under `reviews/<project>/`.
+The parent triages findings with `receiving-code-review` discipline and hands
+actionable items to Phase F. Reviewers must not edit production code.
+
+Use `requesting-code-review` / SDD review-package mechanics: hand reviewers an
+exact BASE..HEAD range or diff artifact, the relevant spec sections, and the
+global constraints — never session history.
 
 1. **Spec-compliance review** — compare implementation against the spec
    clause by clause: exact CLI behavior, error message formats, edge cases,
@@ -138,6 +198,12 @@ Validated on TabbyShell (2026-09-03): after a review produces N actionable
 findings, fix them with **one dedicated subagent per review item**, never one
 mega-fix agent, and never hand-editing in the parent session.
 
+Before dispatching fix lanes, triage findings with `receiving-code-review` and
+the pi-subagents `review-and-validation.md` categories: valid blocker, valid
+non-blocker, stale, invalid, out-of-policy/scope, speculative. Only valid
+blockers/majors enter the fix wave; minors and parked items get explicit
+rulings in the ledger.
+
 1. Group findings into items; group coupled files into one item (e.g. a
    parser signature change plus its call sites must share a lane — splitting
    them breaks compilation between merges).
@@ -145,7 +211,8 @@ mega-fix agent, and never hand-editing in the parent session.
    (`worktree: true`, one writer each). Each lane's packet includes: exact
    file scope, required change, spec citation, and the full gate set it must
    pass before committing (compile, unit tests, assembly, scalafmt, official
-   harness).
+   harness). Prefer `runs.lanes([...])` when a lane has implement→verify
+   stages; use `runs.all([...])` only for simple independent fanout.
 3. The parent integrates **sequentially**: merge one lane at a time into
    `main`, then re-run the full gate set after the final merge. Disjoint file
    sets merge cleanly; verify commit claims against the actual diff
@@ -154,6 +221,9 @@ mega-fix agent, and never hand-editing in the parent session.
    behaviors) run after integration, as their own single subagent.
 5. A final parallel review pass (spec-compliance + code-quality, read-only)
    closes the round; findings re-enter this phase.
+6. Record lane branches/commits, gate evidence, rulings, and parked findings in
+   the project ledger as each wave completes; reconcile ledger vs. git before
+   declaring the round closed.
 
 Gotchas learned:
 - Managed worktree lanes may lose their branch refs when the worktree is
@@ -179,6 +249,9 @@ Gotchas learned:
 - Acceptance harness: run the official tests frequently, not just at the end.
 - Adversarial probes: malformed input, unicode, empty input, huge input,
   missing env vars, missing files, broken pipes, timeout behavior.
+- Gate failures use `systematic-debugging`: confirm the exact HEAD, read the
+  focused failing logs, name the failing contract, classify cause, reproduce
+  narrowly, patch forward.
 - Determinism: freeze time/env in tests; verify no wall-clock or locale leaks.
 
 ## 6. Definition of "passed the capstone"
@@ -186,7 +259,8 @@ Gotchas learned:
 1. Official verifier exits 0 on the full public suite.
 2. Our extended adversarial probes behave sensibly per spec.
 3. Code is formatted, typed, no `any`/unsafe casts without justification.
-4. Every claim of "done" is backed by command output saved as evidence.
+4. Every claim of "done" is backed by fresh command output saved as evidence
+   (`verification-before-completion`) for the exact HEAD being claimed.
 5. Reflection doc completed (what the agent did alone vs. needed intervention).
 
 ## 7. Refinements from the TabbyShell dry run (2026-07-17)
@@ -243,9 +317,12 @@ Findings from building TabbyShell with Scala 3.3.8 + ZIO 2.1.26 on Java 25 LTS:
    - time: `zio.Clock.currentTime(TimeUnit.SECONDS)` — never
      `System.currentTimeMillis()` inside app logic.
    - Allowed raw exceptions, each with an inline comment: TTY detection
-     (`java.lang.System.console()`) and full-stdin reads
-     (`scala.io.Source.stdin`) — ZIO has no equivalent; keep them inside
-     `ZIO.attemptBlocking` and map errors into the domain error ADT.
+     (`java.lang.System.console()`) — ZIO has no equivalent; keep it inside
+     `ZIO.attempt` as a boolean snapshot.
+   - Stdin: use `Console.readLine` (prompt optional). End of input fails with
+     `java.io.EOFException` — handle it with
+     `.catchSome { case _: java.io.EOFException => ... }`, never null checks;
+     `scala.io.Source.stdin` and `scala.io.StdIn.readLine` are prohibited.
    - Blocking file/process/network I/O stays in `ZIO.attemptBlocking`,
      always `mapError`d into the sealed error ADT (TabbyError pattern).
    - Verification command to enforce this in review:
@@ -278,10 +355,12 @@ against the green 50/50 implementation. The full reports are in
    Int/Filesize pairs, `BigDecimal` when a `Float` is involved.
 
 ### Open items for Snap (process, not code)
-1. **Write real unit tests, not just pass-the-harness.** The only unit test
-   was `VersionSpec`; every P1 bug above was invisible to both unit tests and
-   the public suite. Minimum for Snap: spec per module (parser, renderer,
-   formatters, comparators, edge cases).
+1. **Write real unit tests, not just pass-the-harness.** At dry-run time the
+   only unit test was `VersionSpec`; every P1 bug above was invisible to both
+   unit tests and the public suite. Since resolved for TabbyShell (91 unit
+   tests across Value/Parser/Csv/Json/Render/Executor/TabbyError suites).
+   Minimum for Snap: spec per module (parser, renderer, formatters,
+   comparators, edge cases) from day one.
 2. **Pin error-message contracts.** Several messages diverge from the spec's
    `command: expected X, got Y` shape (e.g. bool/null operator restrictions,
    `length` on wrong type). Spec ambiguities (CSV ragged rows, `.5` numbers,
@@ -295,3 +374,40 @@ against the green 50/50 implementation. The full reports are in
    on stderr under Java 25 (harmless for contains-based assertions but noisy
    for exact-stderr assertions); harness prefers
    `/opt/homebrew/opt/openjdk/bin/java` over `PATH` when present.
+
+## 9. Fix round record (TabbyShell round 2, 2026-09-03)
+
+A second review pass (fresh spec-compliance + code-quality lanes over
+`1f7cac6..af9c371`) returned 2 majors and 3 minors; all resolved on `main`
+at `11d2d52` with gates green (91 unit tests, 50/50 harness, scalafmt clean):
+
+1. **`select` duplicate columns** (major): `select name name` fell through
+   `Value.tableTrusted` to `IllegalStateException` → "internal error", exit 2.
+   Fixed in `Executor.select` with a `firstDuplicate` scan that fails with
+   `TabbyError.BadArg("select", "duplicate column: <name>")` before table
+   construction; regressions in `ExecutorSpec`.
+2. **IO error messages** (major): three private `ioMessage` copies shadowed
+   `TabbyError.ioMessage`, so `open` on a missing file printed only the path.
+   Consolidated on `TabbyError.ioMessage` in Executor/External/Main;
+   `TabbyErrorSpec` pins the mappings.
+3. **Deterministic duplicate reporting** (minor): `Value.duplicateKey` now
+   scans left-to-right (first repeated key wins, positional).
+4. **Color rendering tests** (minor): `RenderSpec` asserts exact ANSI
+   sequences per §6.6 instead of a bare ESC[ presence check.
+5. **Ragged-CSV error kind** (minor, ruled): surfaces as `BadArg`
+   ("open: row N has M columns, expected K"); §2's `TypeMismatch` wording
+   conflicts with §3.3's message format, so the deviation is documented in
+   `Csv.scala` rather than forced through the wrong error constructor.
+6. **Parked:** SIGINT/Ctrl-C REPL handling (§7.4) — pre-existing, invisible
+   to the harness, needs real signal handling; setup-error messages
+   intentionally lack the `✗ ` prefix (consistent with the arg-parse path).
+
+Process lessons for future rounds:
+- Two overlapping fix workflows were dispatched after a context reset; the
+  duplicate lanes were reconciled with `git cherry` (patch-equivalence) and
+  stale worktree branches deleted. The ledger requirement in Phase C exists
+  because of this.
+- Disjoint-file lanes merged into `main` cleanly; even two lanes editing
+  different regions of one file auto-merged, but treat that as the exception
+  and prefer disjoint file ownership when forming lanes.
+
