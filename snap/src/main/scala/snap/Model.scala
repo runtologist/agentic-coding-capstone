@@ -15,20 +15,65 @@ object Model {
   /** JavaScript's maximum safe integer (SPEC §3.1). */
   val MaxSafeInteger: Long = 9007199254740991L
 
+  /** An integer validated to lie in `1..=MaxSafeInteger` (SPEC §3.1).
+    *
+    * Values can only be produced through the smart constructors [[PositiveSafeInteger.from]] /
+    * [[PositiveSafeInteger.fromLong]], which enforce integer-ness at JSON boundaries and the
+    * positive safe range everywhere, so an unvalidated integer is unrepresentable downstream of a
+    * parse boundary. Domain models keep raw `Long` fields where non-owned consumers (Diff edit-op
+    * counts, Commands frontier arithmetic, Render) rely on them; the opaque type is unwrapped at
+    * the boundary after validation.
+    */
+  opaque type PositiveSafeInteger = Long
+
+  object PositiveSafeInteger {
+
+    /** Inclusive upper bound of the representable range. */
+    val MaxValue: Long = MaxSafeInteger
+
+    /** Smart constructor for JSON-decoded numbers. Fractional values, zero, negative values, and
+      * values above the JS max safe integer are rejected with the pinned
+      * [[SnapError.NotPositiveSafeInteger]] message for `context`.
+      */
+    def from(bd: JBigDecimal, context: String): Either[SnapError, PositiveSafeInteger] = {
+      val stripped = bd.stripTrailingZeros()
+      if (bd.signum() < 1 || stripped.scale() > 0)
+        Left(SnapError.NotPositiveSafeInteger(context))
+      else if (stripped.compareTo(JBigDecimal.valueOf(MaxValue)) > 0)
+        Left(SnapError.NotPositiveSafeInteger(context))
+      else Right(stripped.toBigIntegerExact.longValueExact())
+    }
+
+    /** Smart constructor for already-decoded longs (CLI revision parsing, revision arithmetic). */
+    def fromLong(n: Long, context: String): Either[SnapError, PositiveSafeInteger] =
+      if (n < 1L || n > MaxValue) Left(SnapError.NotPositiveSafeInteger(context))
+      else Right(n)
+
+    extension (p: PositiveSafeInteger) {
+      def toLong: Long = p
+      def render: String = p.toString
+    }
+  }
+
   /** Validate that a decoded JSON number is a positive safe integer (1..=MaxSafeInteger).
     *
     * This is a domain rule applied at version/revision/count construction time, not a JSON parsing
     * concern: fractional values, zero, negative values, and values above the JS max safe integer
-    * are all rejected. The JSON layer only extracts raw numbers.
+    * are all rejected. The JSON layer only extracts raw numbers. Thin compatibility shim over
+    * [[PositiveSafeInteger.from]] that unwraps to `Long`.
     */
-  def positiveSafeInteger(bd: JBigDecimal, context: String): Either[SnapError, Long] = {
-    val stripped = bd.stripTrailingZeros()
-    if (bd.signum() < 1 || stripped.scale() > 0)
-      Left(SnapError.NotPositiveSafeInteger(context))
-    else if (stripped.compareTo(JBigDecimal.valueOf(MaxSafeInteger)) > 0)
-      Left(SnapError.NotPositiveSafeInteger(context))
-    else Right(stripped.toBigIntegerExact.longValueExact())
-  }
+  def positiveSafeInteger(bd: JBigDecimal, context: String): Either[SnapError, Long] =
+    PositiveSafeInteger.from(bd, context).map(_.toLong)
+
+  /** The next revision for a contributor (`current + 1`), failing with a typed error when the
+    * increment would exceed the JS max safe integer (E1-S1: raw `+ 1` on a frontier revision at the
+    * maximum writes an unloadable 9007199254740992). Commands commit/revert wiring lands in a later
+    * lane; this helper only makes the overflow check available and unit-tested.
+    */
+  def nextRevision(current: Long): Either[SnapError, Long] =
+    if (current < 0L || current >= MaxSafeInteger)
+      Left(SnapError.NotPositiveSafeInteger("revision"))
+    else Right(current + 1L)
 
   /** Maximum UTF-8 byte length of a user-supplied commit message (SPEC §4.2/§7.5). */
   val MaxCommitMessageBytes: Int = 4096
@@ -43,14 +88,15 @@ object Model {
     val ab = utf8Bytes(a)
     val bb = utf8Bytes(b)
     val n = math.min(ab.length, bb.length)
-    var i = 0
-    while (i < n) {
-      val ai = ab(i) & 0xff
-      val bi = bb(i) & 0xff
-      if (ai != bi) return ai - bi
-      i += 1
-    }
-    ab.length - bb.length
+    @scala.annotation.tailrec
+    def compareAt(i: Int): Int =
+      if (i >= n) ab.length - bb.length
+      else {
+        val ai = ab(i) & 0xff
+        val bi = bb(i) & 0xff
+        if (ai != bi) ai - bi else compareAt(i + 1)
+      }
+    compareAt(0)
   }
 
   val PathOrdering: Ordering[String] = (a: String, b: String) => utf8Compare(a, b)
@@ -162,8 +208,10 @@ object Model {
         Left(s"revision '$raw' exceeds the safe range")
       else {
         val n = raw.toLong
-        if (n < 1L || n > MaxSafeInteger) Left(s"revision '$raw' exceeds the safe range")
-        else Right(n)
+        PositiveSafeInteger.fromLong(n, "revision") match {
+          case Right(valid) => Right(valid.toLong)
+          case Left(_)      => Left(s"revision '$raw' exceeds the safe range")
+        }
       }
     }
 
@@ -184,43 +232,42 @@ object Model {
     private def parseParts(
         parts: Vector[String]
     ): Either[SnapError, Version] = {
-      val comps = Vector.newBuilder[(ContributorId, Long)]
-      var prevId: Option[ContributorId] = None
-      var i = 0
-      var failure: Option[SnapError] = None
-      while (i < parts.length && failure.isEmpty) {
-        val part = parts(i)
-        val arrow = part.indexOf("->")
-        if (arrow < 0)
-          failure = Some(SnapError.InvalidVersion(s"component '$part' is missing '->'"))
-        else
-          ContributorId.parse(part.substring(0, arrow)) match {
-            case Left(err) =>
-              failure = Some(SnapError.InvalidVersion(err.detail))
-            case Right(id) =>
-              parseRevision(part.substring(arrow + 2)) match {
-                case Left(reason) =>
-                  failure = Some(SnapError.InvalidVersion(reason))
-                case Right(rev) =>
-                  prevId.foreach { p =>
-                    val cmp = utf8Compare(p.value, id.value)
-                    if (cmp == 0)
-                      failure = Some(SnapError.InvalidVersion(s"duplicate contributor ${id.value}"))
-                    else if (cmp > 0)
-                      failure = Some(
-                        SnapError.InvalidVersion("contributors are not in canonical order")
-                      )
+      type Acc = (Option[ContributorId], Vector[(ContributorId, Long)])
+      // foldLeft with a Left short-circuit guard replaces the early-exit validation loop.
+      parts
+        .foldLeft[Either[SnapError, Acc]](Right((None, Vector.empty))) {
+          case (Left(err), _) => Left(err)
+          case (Right((prevId, comps)), part) =>
+            val arrow = part.indexOf("->")
+            if (arrow < 0)
+              Left(SnapError.InvalidVersion(s"component '$part' is missing '->'"))
+            else
+              ContributorId.parse(part.substring(0, arrow)) match {
+                case Left(err) =>
+                  Left(SnapError.InvalidVersion(err.detail))
+                case Right(id) =>
+                  parseRevision(part.substring(arrow + 2)) match {
+                    case Left(reason) =>
+                      Left(SnapError.InvalidVersion(reason))
+                    case Right(rev) =>
+                      prevId match {
+                        case Some(p) =>
+                          val cmp = utf8Compare(p.value, id.value)
+                          if (cmp == 0)
+                            Left(
+                              SnapError.InvalidVersion(s"duplicate contributor ${id.value}")
+                            )
+                          else if (cmp > 0)
+                            Left(
+                              SnapError.InvalidVersion("contributors are not in canonical order")
+                            )
+                          else Right((Some(id), comps :+ ((id, rev))))
+                        case None => Right((Some(id), comps :+ ((id, rev))))
+                      }
                   }
-                  prevId = Some(id)
-                  comps += ((id, rev))
               }
-          }
-        i += 1
-      }
-      failure match {
-        case Some(err) => Left(err)
-        case None      => Right(Version(comps.result()))
-      }
+        }
+        .map { case (_, comps) => Version(comps) }
     }
 
     private def renderPairs(pairs: Vector[(String, Long)]): String =
@@ -232,49 +279,46 @@ object Model {
       * components.
       */
     def fromPairs(pairs: Vector[(String, Long)], what: String): Either[SnapError, Version] = {
-      val comps = Vector.newBuilder[(ContributorId, Long)]
-      var prevId: Option[ContributorId] = None
-      var i = 0
-      var failure: Option[SnapError] = None
-      while (i < pairs.length && failure.isEmpty) {
-        val (rawId, rev) = pairs(i)
-        ContributorId.parse(rawId) match {
-          case Left(err) =>
-            failure = Some(err)
-          case Right(id) =>
-            if (rev < 1L || rev > MaxSafeInteger)
-              failure = Some(
-                SnapError.NotPositiveSafeInteger(s"$what revision")
-              )
-            else {
-              prevId.foreach { p =>
-                val cmp = utf8Compare(p.value, id.value)
-                if (cmp == 0)
-                  failure = Some(
-                    SnapError.InvalidVersion(s"$what has duplicate contributor ${id.value}")
-                  )
-                else if (cmp > 0)
-                  failure = Some(
-                    if (what == "frontier")
-                      SnapError.NonCanonicalFrontier(
-                        renderPairs(pairs),
-                        renderPairs(
-                          pairs.sortWith((x, y) => utf8Compare(x._1, y._1) < 0)
-                        )
-                      )
-                    else SnapError.InvalidVersion(s"$what is not in canonical order")
-                  )
-              }
-              prevId = Some(id)
-              comps += ((id, rev))
+      type Acc = (Option[ContributorId], Vector[(ContributorId, Long)])
+      // foldLeft with a Left short-circuit guard replaces the early-exit validation loop.
+      pairs
+        .foldLeft[Either[SnapError, Acc]](Right((None, Vector.empty))) {
+          case (Left(err), _) => Left(err)
+          case (Right((prevId, comps)), (rawId, rev)) =>
+            ContributorId.parse(rawId) match {
+              case Left(err) =>
+                Left(err)
+              case Right(id) =>
+                PositiveSafeInteger.fromLong(rev, s"$what revision") match {
+                  case Left(err) => Left(err)
+                  case Right(_) =>
+                    prevId match {
+                      case Some(p) =>
+                        val cmp = utf8Compare(p.value, id.value)
+                        if (cmp == 0)
+                          Left(
+                            SnapError.InvalidVersion(
+                              s"$what has duplicate contributor ${id.value}"
+                            )
+                          )
+                        else if (cmp > 0)
+                          Left(
+                            if (what == "frontier")
+                              SnapError.NonCanonicalFrontier(
+                                renderPairs(pairs),
+                                renderPairs(
+                                  pairs.sortWith((x, y) => utf8Compare(x._1, y._1) < 0)
+                                )
+                              )
+                            else SnapError.InvalidVersion(s"$what is not in canonical order")
+                          )
+                        else Right((Some(id), comps :+ ((id, rev))))
+                      case None => Right((Some(id), comps :+ ((id, rev))))
+                    }
+                }
             }
         }
-        i += 1
-      }
-      failure match {
-        case Some(err) => Left(err)
-        case None      => Right(Version(comps.result()))
-      }
+        .map { case (_, comps) => Version(comps) }
     }
 
     /** Version equal to `base` with the component for `id` forced to `rev` (SPEC §4.2). */
@@ -290,17 +334,14 @@ object Model {
 
     /** SPEC §3.3 four-way causal comparison (absent component = zero). */
     def causalCompare(a: Version, b: Version): CausalOrder = {
-      var less = false
-      var greater = false
       val ids = unionIds(a, b)
-      var i = 0
-      while (i < ids.length && !((less && greater))) {
-        val id = ids(i)
-        val av = a.get(id)
-        val bv = b.get(id)
-        if (av < bv) less = true
-        if (av > bv) greater = true
-        i += 1
+      // foldLeft with a short-circuit guard once both directions are decided.
+      val (less, greater) = ids.foldLeft((false, false)) {
+        case (acc @ (true, true), _) => acc
+        case ((l, g), id) =>
+          val av = a.get(id)
+          val bv = b.get(id)
+          (l || av < bv, g || av > bv)
       }
       if (!less && !greater) CausalOrder.Equal
       else if (less && !greater) CausalOrder.Before
@@ -327,15 +368,11 @@ object Model {
       */
     def snapOrder(a: Version, b: Version): Int = {
       val ids = unionIds(a, b)
-      var i = 0
-      while (i < ids.length) {
-        val id = ids(i)
-        val av = a.get(id)
-        val bv = b.get(id)
-        if (av != bv) return java.lang.Long.compare(av, bv)
-        i += 1
-      }
-      0
+      // Lazy iterator keeps the first-unequal-counter early exit.
+      ids.iterator
+        .map(id => java.lang.Long.compare(a.get(id), b.get(id)))
+        .find(_ != 0)
+        .getOrElse(0)
     }
 
     /** SPEC §4.1: `v` is known when every patch (c, n) with n <= v[c] exists. In a validated
@@ -369,15 +406,12 @@ object Model {
   def tokenize(text: String): Vector[String] = {
     val out = Vector.newBuilder[String]
     val sb = new StringBuilder
-    var i = 0
-    while (i < text.length) {
-      val c = text.charAt(i)
+    text.foreach { c =>
       sb += c
       if (c == '\n') {
         out += sb.result()
         sb.clear()
       }
-      i += 1
     }
     if (sb.nonEmpty) out += sb.result()
     out.result()

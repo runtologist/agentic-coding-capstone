@@ -528,6 +528,77 @@ object ModelSpec extends ZIOSpecDefault {
         )
       }
     ),
+    suite("PositiveSafeInteger opaque type")(
+      test("from accepts 1 and the JS max safe integer") {
+        assertTrue(
+          PositiveSafeInteger
+            .from(new java.math.BigDecimal("1"), "revision")
+            .map(_.toLong) == Right(1L),
+          PositiveSafeInteger
+            .from(new java.math.BigDecimal("9007199254740991"), "revision")
+            .map(_.toLong) == Right(9007199254740991L)
+        )
+      },
+      test("from accepts integer-valued forms 1.0 and 1e2") {
+        assertTrue(
+          PositiveSafeInteger
+            .from(new java.math.BigDecimal("1.0"), "revision")
+            .map(_.toLong) == Right(1L),
+          PositiveSafeInteger
+            .from(new java.math.BigDecimal("1e2"), "revision")
+            .map(_.toLong) == Right(100L)
+        )
+      },
+      test("from rejects 0, negatives, over-max, and fractional with the pinned messages") {
+        assertTrue(
+          PositiveSafeInteger.from(new java.math.BigDecimal("0"), "retain count") ==
+            Left(SnapError.NotPositiveSafeInteger("retain count")),
+          PositiveSafeInteger.from(new java.math.BigDecimal("-1"), "revision") ==
+            Left(SnapError.NotPositiveSafeInteger("revision")),
+          PositiveSafeInteger.from(new java.math.BigDecimal("9007199254740992"), "revision") ==
+            Left(SnapError.NotPositiveSafeInteger("revision")),
+          PositiveSafeInteger.from(new java.math.BigDecimal("1.5"), "revision") ==
+            Left(SnapError.NotPositiveSafeInteger("revision"))
+        )
+      },
+      test("fromLong accepts in-range values and rejects out-of-range with the pinned messages") {
+        assertTrue(
+          PositiveSafeInteger.fromLong(1L, "revision").map(_.toLong) == Right(1L),
+          PositiveSafeInteger
+            .fromLong(9007199254740991L, "revision")
+            .map(_.toLong) == Right(9007199254740991L),
+          PositiveSafeInteger.fromLong(0L, "patch revision") ==
+            Left(SnapError.NotPositiveSafeInteger("patch revision")),
+          PositiveSafeInteger.fromLong(-3L, "delete count") ==
+            Left(SnapError.NotPositiveSafeInteger("delete count")),
+          PositiveSafeInteger.fromLong(9007199254740992L, "frontier revision") ==
+            Left(SnapError.NotPositiveSafeInteger("frontier revision"))
+        )
+      },
+      test("MaxValue is the JS max safe integer") {
+        assertTrue(PositiveSafeInteger.MaxValue == 9007199254740991L)
+      }
+    ),
+    suite("nextRevision")(
+      test("increments revisions below the max") {
+        assertTrue(
+          nextRevision(0L) == Right(1L),
+          nextRevision(1L) == Right(2L),
+          nextRevision(9007199254740990L) == Right(9007199254740991L)
+        )
+      },
+      test("fails at the max safe integer with the pinned revision message") {
+        assertTrue(
+          nextRevision(9007199254740991L) == Left(SnapError.NotPositiveSafeInteger("revision"))
+        )
+      },
+      test("fails for values beyond the max safe integer") {
+        assertTrue(
+          nextRevision(9007199254740992L) == Left(SnapError.NotPositiveSafeInteger("revision")),
+          nextRevision(Long.MaxValue) == Left(SnapError.NotPositiveSafeInteger("revision"))
+        )
+      }
+    ),
     suite("positiveSafeInteger")(
       test("accepts 1 and the JS max safe integer") {
         assertTrue(

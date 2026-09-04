@@ -43,30 +43,24 @@ object Replay {
     */
   private def topoSort(deduped: Vector[Patch]): Either[SnapError, Vector[Patch]] = {
     val integrated = mutable.HashSet.empty[(String, Long)]
-    val remaining = mutable.ArrayBuffer.from(deduped)
-    val out = Vector.newBuilder[Patch]
-    var failure: Option[SnapError] = None
-    while (remaining.nonEmpty && failure.isEmpty) {
-      var best = -1
-      var i = 0
-      while (i < remaining.length) {
-        val p = remaining(i)
-        val ready = p.base.components.forall(c => integrated.contains((c._1.value, c._2)))
-        if (ready && (best < 0 || patchOrdering.compare(remaining(best), p) > 0)) best = i
-        i += 1
-      }
-      if (best < 0) failure = Some(SnapError.CyclicOrIncompleteHistory)
-      else {
-        val chosen = remaining(best)
-        out += chosen
-        integrated += ((chosen.author.value, chosen.revision))
-        remaining.remove(best)
-      }
-    }
-    failure match {
-      case Some(err) => Left(err)
-      case None      => Right(out.result())
-    }
+
+    def ready(p: Patch): Boolean =
+      p.base.components.forall(c => integrated.contains((c._1.value, c._2)))
+
+    // @tailrec selection loop: each round picks the least ready patch (first minimal under
+    // patchOrdering, matching the original scan); a stall means a cycle or missing dependency.
+    @scala.annotation.tailrec
+    def loop(remaining: Vector[Patch], acc: Vector[Patch]): Either[SnapError, Vector[Patch]] =
+      if (remaining.isEmpty) Right(acc)
+      else
+        remaining.filter(ready).minByOption(identity)(patchOrdering) match {
+          case None => Left(SnapError.CyclicOrIncompleteHistory)
+          case Some(chosen) =>
+            integrated += ((chosen.author.value, chosen.revision))
+            loop(remaining.filterNot(_ == chosen), acc :+ chosen)
+        }
+
+    loop(deduped, Vector.empty)
   }
 
   /** Collapse structurally equal duplicate dots; different values at one dot are corruption (SPEC
@@ -74,17 +68,19 @@ object Replay {
     */
   def dedupePatches(patches: Vector[Patch]): Either[SnapError, Vector[Patch]] = {
     val seen = mutable.LinkedHashMap.empty[(String, Long), Patch]
-    var failure: Option[SnapError] = None
-    val it = patches.iterator
-    while (it.hasNext && failure.isEmpty) {
-      val p = it.next()
-      val key = (p.author.value, p.revision)
-      seen.get(key) match {
-        case Some(prev) if !Patch.sameValue(prev, p) =>
-          failure = Some(SnapError.PatchCollision(p.author.value, p.revision))
-        case Some(_) => () // structural duplicate: collapses to one patch
-        case None    => seen(key) = p
-      }
+    // foldLeft with a short-circuit guard replaces the early-exit iterator loop.
+    val failure = patches.foldLeft[Option[SnapError]](None) {
+      case (Some(err), _) => Some(err)
+      case (None, p) =>
+        val key = (p.author.value, p.revision)
+        seen.get(key) match {
+          case Some(prev) if !Patch.sameValue(prev, p) =>
+            Some(SnapError.PatchCollision(p.author.value, p.revision))
+          case Some(_) => None // structural duplicate: collapses to one patch
+          case None =>
+            seen(key) = p
+            None
+        }
     }
     failure match {
       case Some(err) => Left(err)
@@ -143,32 +139,25 @@ object Replay {
     integrationOrder(selected) match {
       case Left(err) => Left(err)
       case Right(order) =>
-        var tree = Model.emptyTree
         val warnings = mutable.ArrayBuffer.empty[ReplayWarning]
-        var failure: Option[SnapError] = None
-        val it = order.iterator
-        while (it.hasNext && failure.isEmpty) {
-          val p = it.next()
-          treeAt(all, p.base, memo) match {
-            case Left(err) => failure = Some(err)
-            case Right(baseTree) =>
-              validate(p, baseTree) match {
-                case Left(err) => failure = Some(err)
-                case Right(()) =>
-                  integratePatch(tree, baseTree, p) match {
-                    case Left(err) => failure = Some(err)
-                    case Right((next, ws)) =>
-                      tree = next
-                      warnings ++= ws
-                  }
+        // foldLeft with a Left short-circuit guard replaces the early-exit iterator loop.
+        order
+          .foldLeft[Either[SnapError, Model.Tree]](Right(Model.emptyTree)) {
+            case (Left(err), _) => Left(err)
+            case (Right(tree), p) =>
+              val stepped = for {
+                baseTree <- treeAt(all, p.base, memo)
+                _ <- validate(p, baseTree)
+                integrated <- integratePatch(tree, baseTree, p)
+              } yield integrated
+              stepped match {
+                case Left(err) => Left(err)
+                case Right((next, ws)) =>
+                  warnings ++= ws
+                  Right(next)
               }
           }
-        }
-        failure match {
-          case Some(err) => Left(err)
-          case None =>
-            Right((tree, warnings.toVector.distinct.sorted(ReplayWarning.byPathThenReason)))
-        }
+          .map(tree => (tree, warnings.toVector.distinct.sorted(ReplayWarning.byPathThenReason)))
     }
 
   /** Tree at version `target` from patch set `all`, memoized per version. `target` shrinks strictly
@@ -204,29 +193,34 @@ object Replay {
 
     // Authored result per changed path: None means the patch deletes the path.
     val authored = mutable.LinkedHashMap.empty[String, Option[Array[Byte]]]
-    var failure: Option[SnapError] = None
-    val chIt = patch.changes.iterator
-    while (chIt.hasNext && failure.isEmpty) {
-      val change = chIt.next()
-      change match {
-        case Change.Del(path)        => authored(path) = None
-        case Change.Put(path, bytes) => authored(path) = Some(bytes)
-        case Change.Text(path, edit) =>
-          val baseTokens = base.get(path) match {
-            case Some(bytes) if Model.isText(bytes) =>
-              Model.decodeUtf8(bytes).map(Model.tokenize).getOrElse(Vector.empty)
-            case _ => Vector.empty
-          }
-          Model.applyEdit(baseTokens, edit, path) match {
-            case Left(err) => failure = Some(err)
-            case Right(tokens) =>
-              authored(path) = Some(Model.utf8Bytes(Model.detokenize(tokens)))
-          }
-      }
+    // foldLeft with a Left short-circuit guard replaces the early-exit authored loop.
+    val authoredResult = patch.changes.foldLeft[Either[SnapError, Unit]](Right(())) {
+      case (Left(err), _) => Left(err)
+      case (Right(()), change) =>
+        change match {
+          case Change.Del(path) =>
+            authored(path) = None
+            Right(())
+          case Change.Put(path, bytes) =>
+            authored(path) = Some(bytes)
+            Right(())
+          case Change.Text(path, edit) =>
+            val baseTokens = base.get(path) match {
+              case Some(bytes) if Model.isText(bytes) =>
+                Model.decodeUtf8(bytes).map(Model.tokenize).getOrElse(Vector.empty)
+              case _ => Vector.empty
+            }
+            Model.applyEdit(baseTokens, edit, path) match {
+              case Left(err) => Left(err)
+              case Right(tokens) =>
+                authored(path) = Some(Model.utf8Bytes(Model.detokenize(tokens)))
+                Right(())
+            }
+        }
     }
-    failure match {
-      case Some(err) => Left(err)
-      case None      =>
+    authoredResult match {
+      case Left(err) => Left(err)
+      case Right(()) =>
         // Namespace resolution: S = paths the patch makes present; C' = current minus the patch's
         // authored deletions. A path in S with a proper ancestor or descendant in C' is installed
         // as authored and every conflicting current path is removed, each removal warning
@@ -250,67 +244,75 @@ object Replay {
         for (s <- nsInstall) installs(s) = authored(s).get
         removals ++= nsRemove
 
-        val ruleIt = patch.changes.iterator
-        while (ruleIt.hasNext && failure.isEmpty) {
-          val change = ruleIt.next()
-          val path = change.path
-          if (!nsInstall.contains(path) && !nsRemove.contains(path)) {
-            val bOpt = base.get(path)
-            val cOpt = current.get(path)
-            val tOpt = authored(path)
-            if (sameContent(bOpt, cOpt)) {
-              // Rule 1: identical in base and current → apply the authored change directly.
-              tOpt match {
-                case Some(bytes) => installs(path) = bytes
-                case None        => removals += path
-              }
-            } else if (sameContent(cOpt, tOpt)) {
-              // Rule 2: identical concurrent change collapses; keep current, no warning.
-              ()
-            } else {
-              val isTextChange = change match {
-                case _: Change.Text => true
-                case _              => false
-              }
-              val allText = isTextChange &&
-                bOpt.exists(Model.isText) && cOpt.exists(Model.isText) && tOpt.exists(Model.isText)
-              if (allText) {
-                // Rule 3: transform the patch's edit through the aggregate context edit (§6.3).
-                val bTokens = Model.tokenize(Model.decodeUtf8(bOpt.get).get)
-                val cTokens = Model.tokenize(Model.decodeUtf8(cOpt.get).get)
-                val contextEdit = Diff.canonicalDiff(bTokens, cTokens)
-                val transformed = Ot.transform(change.asInstanceOf[Change.Text].edit, contextEdit)
-                Model.applyEdit(cTokens, transformed, path) match {
-                  case Left(err) => failure = Some(err)
-                  case Right(tokens) =>
-                    installs(path) = Model.utf8Bytes(Model.detokenize(tokens))
+        // Per-path §6.2/§6.4 rules as a pattern match (E3-N1: the guarded Change.Text cast is
+        // gone); foldLeft with a Left short-circuit replaces the early-exit rules loop.
+        val rulesResult = patch.changes.foldLeft[Either[SnapError, Unit]](Right(())) {
+          case (Left(err), _) => Left(err)
+          case (Right(()), change) =>
+            val path = change.path
+            if (nsInstall.contains(path) || nsRemove.contains(path)) Right(())
+            else {
+              val bOpt = base.get(path)
+              val cOpt = current.get(path)
+              val tOpt = authored(path)
+              if (sameContent(bOpt, cOpt)) {
+                // Rule 1: identical in base and current → apply the authored change directly.
+                tOpt match {
+                  case Some(bytes) => installs(path) = bytes
+                  case None        => removals += path
                 }
-              } else if (tOpt.isEmpty) {
-                // §6.4 rule 2: incoming delete wins.
-                removals += path
-                warnings += ReplayWarning.DeleteWins(path)
-              } else if (bOpt.isDefined && cOpt.isEmpty) {
-                // §6.4 rule 3: the earlier concurrent delete wins.
-                removals += path
-                warnings += ReplayWarning.DeleteWins(path)
-              } else if (bOpt.isEmpty && cOpt.isDefined) {
-                // §6.4 rule 4: the incoming (canonically later) create wins.
-                installs(path) = tOpt.get
-                warnings += ReplayWarning.LaterCreateWins(path)
-              } else if (change.isInstanceOf[Change.Put]) {
-                // §6.4 rule 5: the incoming atomic replacement wins.
-                installs(path) = tOpt.get
-                warnings += ReplayWarning.LaterPutWins(path)
+                Right(())
+              } else if (sameContent(cOpt, tOpt)) {
+                // Rule 2: identical concurrent change collapses; keep current, no warning.
+                Right(())
               } else {
-                // §6.4 rule 6: incoming text vs non-text current → current wins.
-                warnings += ReplayWarning.PutWins(path)
+                change match {
+                  case Change.Text(_, edit)
+                      if bOpt.exists(Model.isText) &&
+                        cOpt.exists(Model.isText) &&
+                        tOpt.exists(Model.isText) =>
+                    // Rule 3: transform the patch's edit through the aggregate context edit (§6.3).
+                    val bTokens = Model.tokenize(Model.decodeUtf8(bOpt.get).get)
+                    val cTokens = Model.tokenize(Model.decodeUtf8(cOpt.get).get)
+                    val contextEdit = Diff.canonicalDiff(bTokens, cTokens)
+                    val transformed = Ot.transform(edit, contextEdit)
+                    Model.applyEdit(cTokens, transformed, path) match {
+                      case Left(err) => Left(err)
+                      case Right(tokens) =>
+                        installs(path) = Model.utf8Bytes(Model.detokenize(tokens))
+                        Right(())
+                    }
+                  case _ if tOpt.isEmpty =>
+                    // §6.4 rule 2: incoming delete wins.
+                    removals += path
+                    warnings += ReplayWarning.DeleteWins(path)
+                    Right(())
+                  case _ if bOpt.isDefined && cOpt.isEmpty =>
+                    // §6.4 rule 3: the earlier concurrent delete wins.
+                    removals += path
+                    warnings += ReplayWarning.DeleteWins(path)
+                    Right(())
+                  case _ if bOpt.isEmpty && cOpt.isDefined =>
+                    // §6.4 rule 4: the incoming (canonically later) create wins.
+                    installs(path) = tOpt.get
+                    warnings += ReplayWarning.LaterCreateWins(path)
+                    Right(())
+                  case _: Change.Put =>
+                    // §6.4 rule 5: the incoming atomic replacement wins.
+                    installs(path) = tOpt.get
+                    warnings += ReplayWarning.LaterPutWins(path)
+                    Right(())
+                  case _ =>
+                    // §6.4 rule 6: incoming text vs non-text current → current wins.
+                    warnings += ReplayWarning.PutWins(path)
+                    Right(())
+                }
               }
             }
-          }
         }
-        failure match {
-          case Some(err) => Left(err)
-          case None =>
+        rulesResult match {
+          case Left(err) => Left(err)
+          case Right(()) =>
             val next = (current -- removals) ++ installs
             Right((next, warnings.toVector))
         }

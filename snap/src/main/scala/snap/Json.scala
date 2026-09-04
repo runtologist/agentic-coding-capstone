@@ -136,7 +136,9 @@ object Json {
       case ZJson.Arr(items) if items.length == 2 =>
         (items(0), items(1)) match {
           case (ZJson.Str(id), ZJson.Num(rev)) =>
-            Model.positiveSafeInteger(rev, s"$what revision").map(r => (id, r))
+            // Decode boundary: validated via the PositiveSafeInteger smart constructor, then
+            // unwrapped to Long for the domain model's stable public signature.
+            Model.PositiveSafeInteger.from(rev, s"$what revision").map(r => (id, r.toLong))
           case _ =>
             Left(
               SnapError.InvalidVersion(s"$what entries must be two-element [id, revision] pairs")
@@ -162,7 +164,8 @@ object Json {
                 authorStr <- requiredString(fields, "author", "patch")
                 author <- Model.ContributorId.parse(authorStr)
                 revBd <- requiredNumber(fields, "revision", "patch")
-                revision <- Model.positiveSafeInteger(revBd, "patch revision")
+                // Decode boundary: smart-constructor validation, unwrapped to Long for Patch.
+                revision <- Model.PositiveSafeInteger.from(revBd, "patch revision").map(_.toLong)
                 baseArr <- requiredArray(fields, "base", "patch")
                 base <- versionFromPairs(baseArr, "base")
                 message <- requiredString(fields, "message", "patch")
@@ -239,9 +242,14 @@ object Json {
           else
             fields.head match {
               case ("retain", ZJson.Num(n)) =>
-                Model.positiveSafeInteger(n, "retain count").map(Model.EditOp.Retain.apply)
+                // Decode boundary: smart-constructor validation, unwrapped to Long for EditOp.
+                Model.PositiveSafeInteger
+                  .from(n, "retain count")
+                  .map(v => Model.EditOp.Retain(v.toLong))
               case ("delete", ZJson.Num(n)) =>
-                Model.positiveSafeInteger(n, "delete count").map(Model.EditOp.Delete.apply)
+                Model.PositiveSafeInteger
+                  .from(n, "delete count")
+                  .map(v => Model.EditOp.Delete(v.toLong))
               case ("insert", ZJson.Arr(items)) =>
                 if (items.isEmpty) Left(SnapError.EmptyField("edit", "insert"))
                 else
@@ -303,14 +311,13 @@ object Json {
   /** Field list of an object, rejecting duplicate keys (SPEC §4.1 unique object keys). */
   private def objectFields(obj: ZJson.Obj): Either[SnapError, Fields] = {
     val seen = scala.collection.mutable.HashSet.empty[String]
-    val b = Vector.newBuilder[(String, ZJson)]
-    val it = obj.fields.iterator
-    while (it.hasNext) {
-      val (key, value) = it.next()
-      if (!seen.add(key)) return Left(SnapError.DuplicateJsonKey(key))
-      b += ((key, value))
+    // foldLeft with a Left short-circuit guard replaces the early-exit iterator loop.
+    obj.fields.foldLeft[Either[SnapError, Fields]](Right(Vector.empty)) {
+      case (Left(err), _) => Left(err)
+      case (Right(acc), (key, value)) =>
+        if (!seen.add(key)) Left(SnapError.DuplicateJsonKey(key))
+        else Right(acc :+ ((key, value)))
     }
-    Right(b.result())
   }
 
   private def find(fields: Fields, name: String): Option[ZJson] =
@@ -352,30 +359,22 @@ object Json {
       case None    => Left(SnapError.InvalidJson(s"$what: missing field '$name'"))
     }
 
-  private def seqEither[A](xs: Vector[Either[SnapError, A]]): Either[SnapError, Vector[A]] = {
-    val b = Vector.newBuilder[A]
-    val it = xs.iterator
-    while (it.hasNext) {
-      it.next() match {
-        case Left(e)  => return Left(e)
-        case Right(a) => b += a
-      }
+  private def seqEither[A](xs: Vector[Either[SnapError, A]]): Either[SnapError, Vector[A]] =
+    // foldLeft with a Left short-circuit guard replaces the early-exit iterator loop.
+    xs.foldLeft[Either[SnapError, Vector[A]]](Right(Vector.empty)) {
+      case (Left(err), _)         => Left(err)
+      case (Right(_), Left(err))  => Left(err)
+      case (Right(acc), Right(a)) => Right(acc :+ a)
     }
-    Right(b.result())
-  }
 
-  private def isBlankAfter(s: String, from: Int): Boolean = {
-    var i = from
-    while (i < s.length) {
-      val c = s.charAt(i)
-      if (c != ' ' && c != '\t' && c != '\n' && c != '\r') return false
-      i += 1
-    }
-    true
-  }
+  private def isBlankAfter(s: String, from: Int): Boolean =
+    s.indexWhere(c => c != ' ' && c != '\t' && c != '\n' && c != '\r', from) < 0
 
   /** Index just past the first complete top-level JSON value. Assumes `input` already parsed; this
     * only locates the value boundary so strict mode can detect trailing bytes.
+    *
+    * KEPT as while loops (H2): this is a hot mutable-position character scanner — recursive or fold
+    * rewrites would thread position state through every helper and hurt clarity/perf.
     */
   private def firstValueEnd(s: String): Option[Int] = {
     var pos = 0
@@ -534,21 +533,14 @@ object Json {
   // Canonical writer (Node JSON.stringify(value, null, 2) compatible)
   // ---------------------------------------------------------------------------
 
-  private def pad(sb: StringBuilder, level: Int): Unit = {
-    var i = 0
-    while (i < level) {
-      sb.append("  ")
-      i += 1
-    }
-  }
+  private def pad(sb: StringBuilder, level: Int): Unit =
+    sb.append("  " * level)
 
   private def writeVersion(sb: StringBuilder, v: Model.Version, level: Int): Unit = {
     val cs = v.components
     if (cs.isEmpty) { sb.append("[]"); return }
     sb.append("[\n")
-    var i = 0
-    while (i < cs.length) {
-      val (id, rev) = cs(i)
+    cs.zipWithIndex.foreach { case ((id, rev), i) =>
       pad(sb, level + 1)
       sb.append("[\n")
       pad(sb, level + 2)
@@ -561,7 +553,6 @@ object Json {
       sb.append(']')
       if (i < cs.length - 1) sb.append(',')
       sb.append('\n')
-      i += 1
     }
     pad(sb, level)
     sb.append(']')
@@ -570,13 +561,11 @@ object Json {
   private def writePatches(sb: StringBuilder, patches: Vector[Model.Patch], level: Int): Unit = {
     if (patches.isEmpty) { sb.append("[]"); return }
     sb.append("[\n")
-    var i = 0
-    while (i < patches.length) {
+    patches.zipWithIndex.foreach { case (p, i) =>
       pad(sb, level + 1)
-      writePatch(sb, patches(i), level + 1)
+      writePatch(sb, p, level + 1)
       if (i < patches.length - 1) sb.append(',')
       sb.append('\n')
-      i += 1
     }
     pad(sb, level)
     sb.append(']')
@@ -597,13 +586,11 @@ object Json {
   private def writeChanges(sb: StringBuilder, changes: Vector[Model.Change], level: Int): Unit = {
     if (changes.isEmpty) { sb.append("[]"); return }
     sb.append("[\n")
-    var i = 0
-    while (i < changes.length) {
+    changes.zipWithIndex.foreach { case (c, i) =>
       pad(sb, level + 1)
-      writeChange(sb, changes(i), level + 1)
+      writeChange(sb, c, level + 1)
       if (i < changes.length - 1) sb.append(',')
       sb.append('\n')
-      i += 1
     }
     pad(sb, level)
     sb.append(']')
@@ -633,13 +620,11 @@ object Json {
   private def writeEditOps(sb: StringBuilder, ops: Vector[Model.EditOp], level: Int): Unit = {
     if (ops.isEmpty) { sb.append("[]"); return }
     sb.append("[\n")
-    var i = 0
-    while (i < ops.length) {
+    ops.zipWithIndex.foreach { case (op, i) =>
       pad(sb, level + 1)
-      writeEditOp(sb, ops(i), level + 1)
+      writeEditOp(sb, op, level + 1)
       if (i < ops.length - 1) sb.append(',')
       sb.append('\n')
-      i += 1
     }
     pad(sb, level)
     sb.append(']')
@@ -663,13 +648,11 @@ object Json {
   private def writeInsertTokens(sb: StringBuilder, tokens: Vector[String], level: Int): Unit = {
     if (tokens.isEmpty) { sb.append("[]"); return }
     sb.append("[\n")
-    var i = 0
-    while (i < tokens.length) {
+    tokens.zipWithIndex.foreach { case (t, i) =>
       pad(sb, level + 1)
-      writeString(sb, tokens(i))
+      writeString(sb, t)
       if (i < tokens.length - 1) sb.append(',')
       sb.append('\n')
-      i += 1
     }
     pad(sb, level)
     sb.append(']')
@@ -677,6 +660,9 @@ object Json {
 
   /** JSON string escaping compatible with `JSON.stringify`: named escapes for \b \f \n \r \t, `\"`
     * and `\\`, `\u00xx` (lowercase hex) for other control characters, and escaped lone surrogates.
+    *
+    * KEPT as a while loop (H2): surrogate-pair handling advances the index two chars at once, so a
+    * foreach/zipWithIndex rewrite would need awkward skip state and lose clarity and speed.
     */
   private def writeString(sb: StringBuilder, s: String): Unit = {
     sb.append('"')
