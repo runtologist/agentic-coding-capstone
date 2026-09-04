@@ -74,3 +74,4 @@ After any sbt config change: `sbt --client shutdown` first.
 | 2026-09-05 | C gate | Combined Wave-2 gate green on develop @ `5a315f1`: 253 tests passed (0 failed), assembly built, scalafmt clean. L6 ✅ J1 ✅ L2 ✅ all merged. | pushed develop + task branches to origin |
 | 2026-09-05 | C wave-3 | Dispatching L3 codec+replay lane (single sequential lane); packet written | docs/snap/packets/L3-codec-replay.md |
 | 2026-09-05 | C L3 | L3 codec+replay completed on task/06-codec-replay @ 4f9db92. 80 new tests (CodecSpec 45 + ReplaySpec 35), 333 total passing. | merged to develop as 0cbb111; gate green |
+| 2026-09-05 | C wave-4 | Wrote L4 (tree/io/config) and L5 (HTTP) packets; dispatching parallel lanes from develop @ 1e388b2+; harness baseline checkpoint running concurrently on develop | docs/snap/packets/L4-tree-io-config.md, L5-http.md |
