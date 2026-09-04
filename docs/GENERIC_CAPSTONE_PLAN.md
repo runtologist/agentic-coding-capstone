@@ -8,6 +8,11 @@ Use available skills explicitly at each stage (Superpowers and pi-subagents).
 If a named skill is unavailable, follow its written process manually and record
 the fallback in the project ledger.
 
+Long-running commands (sbt gate suites, official harness) and multi-model
+review/fusion checks run as background tasks in the orchestrator session so
+the parent keeps making independent progress; see "Background execution"
+below.
+
 ## 0. Non-negotiable quality gates
 
 Every task is "done" only when ALL of these pass:
@@ -86,6 +91,38 @@ Anti-patterns:
 | Integration | `finishing-a-development-branch`, `systematic-debugging`, `verification-before-completion` | sequential merges, gate-failure investigation, fresh evidence before claims |
 | Review | `requesting-code-review`, `receiving-code-review`, `pi-subagents` review references | fresh-context review lanes, finding disposition, evidence-based feedback |
 | Fix round | `receiving-code-review`, `dispatching-parallel-agents`, `systematic-debugging`, `verification-before-completion`, `memory-write` | triage findings, parallel worktree fixes, debug failures, record lessons |
+| Background execution | `bg_run`, `bg_status`, `bg_logs`, `bg_delegate`, `fusion_reason`, `fusion_investigate`, `fusion_validate` | non-blocking gate runs, multi-model review lanes, triage oracles |
+
+## Background execution (orchestrator-level)
+
+Long commands and multi-model checks run as background tasks in the parent
+(orchestrator) session, which keeps doing independent work and is woken by
+terminal notifications.
+
+| Phase | Tool | Use |
+|---|---|---|
+| A, D, F gates | `bg_run` | sbt gate suites and official harness runs, with timeouts |
+| B, F rulings | `fusion_reason` | tool-less multi-model deliberation on tradeoffs and contested findings |
+| E extra lanes | `fusion_investigate`, `fusion_validate` | clean-context multi-model spec hunt; advisory post-green validation |
+| E triage | `bg_delegate` | inspect-only oracle questions carrying conversation context |
+
+Operational rules:
+
+1. `isAgent: false` for sbt/harness commands; `true` only when the task
+   itself launches an LLM/agent process.
+2. Names are 2–6 words ("full gates after merge 2"), never raw commands.
+3. Never poll `bg_status`/`bg_logs` as a wait loop; terminal notifications
+   wake a follow-up turn. Inspect only on explicit request, hang evidence,
+   or after a notification.
+4. Cap gate tasks with timeouts (e.g. 900s sbt, 600s harness) so hangs fail
+   loudly instead of blocking the wave.
+5. Record task IDs and output paths in the ledger alongside lanes/commits.
+6. `fusion_validate` is advisory and never replaces the non-negotiable gates.
+7. Child lanes must not depend on `bg_*` — their turn ends with the task.
+   The one-writer-per-worktree rule is unchanged by background execution.
+8. Parallel gates from different worktrees each start their own
+   `sbt --client` server; keep lane gates inside the lane and reserve
+   orchestrator-level `bg_run` for integration/final suites.
 
 ## 3. Parallel subagent strategy
 
@@ -96,6 +133,9 @@ Parallelism is only safe when modules have fixed interfaces.
 - Freeze these as the "contract files" other agents code against.
 - Apply `test-driven-development`: include failing/invariant tests for the
   shared interfaces as part of the foundation, not after implementation.
+- Run the gate suite as a named background task (`bg_run`, `isAgent: false`)
+  while continuing contract/scaffolding work; verify from the terminal
+  notification, never by polling.
 
 ### Phase B — Architecture proposal (sequential, one architect)
 
@@ -112,6 +152,9 @@ Before any implementation packet is written:
 6. Obtain explicit review and approval before parallel work starts: human
    approval via `brainstorming`/`ask-user`; optionally `council-mode` for
    tradeoffs or `plannotator` for annotated plan review.
+7. For material design tradeoffs, optionally run `fusion_reason` as a
+   tool-less multi-model deliberation and record the verdict (and rejected
+   alternatives) in ARCHITECTURE.md.
 
 Only after approval are Phase C packets created, each referencing the frozen
 contracts in `docs/<project>/ARCHITECTURE.md`.
@@ -138,6 +181,9 @@ Orchestration:
   bounded parallel lanes with implement→verify stages; use `runs.all([...])`
   only for simple independent fanout.
 - Keep one writer per cwd/worktree; reviewers are read-only and fresh-context.
+- Child lanes run their own gates **synchronously** (bash with timeouts). Do
+  not rely on `bg_*` inside lane children: their lifetime ends with the task;
+  background tasks belong to the orchestrator session.
 
 Ledger:
 
@@ -157,6 +203,10 @@ Ledger:
   before patching.
 - Use `verification-before-completion`: no merge is "green" without fresh gate
   output for the exact merged HEAD.
+- Run post-merge gate suites as named background tasks (`bg_run` with
+  timeouts, e.g. 900s sbt, 600s harness); while they run, update the ledger
+  and prepare Phase E packets. The terminal notification starts the next
+  merge step.
 
 ### Phase E — Adversarial review (parallel lanes, parent triage)
 
@@ -183,6 +233,14 @@ global constraints — never session history.
    covered by the public suite: missing files, malformed input, bad escapes,
    boundary dates/times, truncation, unusual Unicode, empty/large inputs,
    external-command failures, `--eval`, and REPL smoke tests.
+5. **Multi-model lanes (background)** — `fusion_investigate` runs a
+   clean-context multi-model hunt for subtle spec violations that
+   single-model lanes may share a blind spot for; after the suite is green,
+   `fusion_validate` adds a structured advisory review (never a replacement
+   for the non-negotiable gates). `bg_delegate` answers quick oracle questions
+   during triage — it carries conversation context and is inspect-only, so it
+   complements fresh-context lanes and cannot replace the dynamic-probing
+   lane.
 
 Review output requirements:
 - Every finding must be ranked: blocker / major / minor / nit.
@@ -204,6 +262,10 @@ non-blocker, stale, invalid, out-of-policy/scope, speculative. Only valid
 blockers/majors enter the fix wave; minors and parked items get explicit
 rulings in the ledger.
 
+Contested findings (ambiguous spec readings, e.g. "TypeMismatch vs BadArg")
+go through `fusion_reason` for a multi-model ruling before the ledger ruling
+is written.
+
 1. Group findings into items; group coupled files into one item (e.g. a
    parser signature change plus its call sites must share a lane — splitting
    them breaks compilation between merges).
@@ -224,6 +286,9 @@ rulings in the ledger.
 6. Record lane branches/commits, gate evidence, rulings, and parked findings in
    the project ledger as each wave completes; reconcile ledger vs. git before
    declaring the round closed.
+7. Run the closing full gate suite as a named background task and attach a
+   `fusion_validate` advisory check on the merged HEAD; declare the round
+   closed only after both complete with recorded evidence.
 
 Gotchas learned:
 - Managed worktree lanes may lose their branch refs when the worktree is
