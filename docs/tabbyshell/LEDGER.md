@@ -106,3 +106,22 @@ Overall: **91.92% statement / 89.85% branch** — target (≈80% stmt) met.
 Remaining Main gap is the interactive REPL cluster and `Main.run` exit path
 (parked above); remaining External gap is the live HTTP call.
 
+## CI setup (2026-09-04, commits `b09e76d`, `8ce0d1d`)
+
+- Vendored an unmodified snapshot of the workshop acceptance harness into
+  `harness/tabbyshell/` (`verify`, `run_tests`, `test-harness/`, `tests/`,
+  `fixtures/`, `SPEC.md`; `node_modules` excluded). Rule: no edits to vendored
+  files; re-copy from workshop materials to update.
+- Added `.github/workflows/capstone-ci.yml`: auto-discovers every top-level
+  dir with a `build.sbt`, then per project runs
+  `sbt "scalafmtCheckAll; test; assembly"` and, if `harness/<project>/`
+  exists, installs its npm deps and runs `run_tests --lang scala`.
+  New capstones (e.g. `snap/`) are picked up automatically.
+- `scripts/verify-tabbyshell.sh` now prefers the vendored harness, falling
+  back to the workshop copy.
+- Local validation before push: `sbt "test; assembly"` → 411/411, jar built;
+  vendored `run_tests` → 50/50 passed (13.4 s).
+- GitHub Actions first run on push: workflow run 33874539613 (status tracked
+  separately; see monitor notes).
+
+
