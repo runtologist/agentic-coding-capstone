@@ -106,7 +106,7 @@ Overall: **91.92% statement / 89.85% branch** — target (≈80% stmt) met.
 Remaining Main gap is the interactive REPL cluster and `Main.run` exit path
 (parked above); remaining External gap is the live HTTP call.
 
-## CI setup (2026-09-04, commits `b09e76d`, `8ce0d1d`)
+## CI setup (2026-09-04, commits `b09e76d`, `8ce0d1d`, `f217c59`, `4b528c5`)
 
 - Vendored an unmodified snapshot of the workshop acceptance harness into
   `harness/tabbyshell/` (`verify`, `run_tests`, `test-harness/`, `tests/`,
@@ -118,11 +118,27 @@ Remaining Main gap is the interactive REPL cluster and `Main.run` exit path
   exists, installs its npm deps and runs `run_tests --lang scala`.
   New capstones (e.g. `snap/`) are picked up automatically.
 - `scripts/verify-tabbyshell.sh` now prefers the vendored harness, falling
-  back to the workshop copy.
-- Local validation before push: `sbt "test; assembly"` → 411/411, jar built;
-  vendored `run_tests` → 50/50 passed (13.4 s).
-- GitHub Actions first run on push: workflow run 33874539613 (status tracked
-  separately; see monitor notes).
+  back to the workshop copy (scripts later removed from the repo in `98b89b6`;
+  CI and local `bash harness/tabbyshell/run_tests` are the canonical paths).
+- GitHub Actions first run on push: workflow run 33874539613 — all steps
+  passed, including the acceptance-harness step.
+- `f217c59`: bumped actions to node24-era majors, added step summaries
+  (`$GITHUB_STEP_SUMMARY`), explicit "Verify acceptance test results" gate
+  (hard-fails unless passed count >= number of YAML cases), and
+  `upload-artifact` for sbt + harness logs. Run 33875789027: success,
+  artifact `test-logs-tabbyshell` produced, no error annotations.
+- `4b528c5`: corrected action pins to the latest existing majors
+  (checkout@v7, setup-java@v6, cache@v6, setup-node@v7,
+  upload-artifact@v7; sbt/setup-sbt@v1 retained — no newer major).
+  Interim commit `6e245fd` had referenced nonexistent v8/v7 tags and failed
+  at "Set up job"; fixed and re-pushed. Resulting run 33880570441: success,
+  zero deprecation annotations.
+- Test-run verification (run 33880570441, commit `4b528c5`): sbt step and
+  "Summarize sbt unit test results" both succeeded (ZIO output includes
+  `411 tests passed. 0 tests failed.`); harness step and "Verify acceptance
+  test results" both succeeded, enforcing >= 50 passing cases (50 YAML
+  files). Log artifact uploaded. Local re-run confirmed 411/411 sbt and
+  50/50 harness.
 
 ## Plan maintenance
 
