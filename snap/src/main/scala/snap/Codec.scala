@@ -310,9 +310,17 @@ object Codec {
     edit.sliding(2).collectFirst { case Vector(a, b) if kind(a) == kind(b) => kind(a) }
   }
 
-  /** Step 14: change paths within one patch form a prefix-free set. */
+  /** Step 14: change paths within one patch form a prefix-free set.
+    *
+    * Only paths present in the authored result can conflict: deletions remove their path from the
+    * result, so e.g. `delete a` + `create a/b` (a file→directory transition, test 07) is valid.
+    * Duplicate paths are already rejected by [[checkChangesSortedAndUnique]].
+    */
   private def checkPrefixConflicts(changes: Vector[Change]): Either[SnapError, Unit] = {
-    val paths = changes.map(_.path)
+    val paths = changes.collect {
+      case Change.Text(path, _) => path
+      case Change.Put(path, _)  => path
+    }
     var failure: Option[SnapError] = None
     var i = 0
     while (i < paths.length && failure.isEmpty) {
