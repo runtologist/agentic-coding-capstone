@@ -14,7 +14,17 @@ object External {
 
   private val esc = "\u001b"
 
-  def run(name: String, args: List[String], state: ShellState): IO[TabbyError, Value] = {
+  def run(name: String, args: List[String], state: ShellState): IO[TabbyError, Value] =
+    runWithEnv(name, args, state)(key => ZSystem.env(key).orDie)
+
+  /** [[run]] with the environment reads injected so tests can exercise the success/fallback paths
+    * deterministically without touching the real environment.
+    */
+  private[tabbyshell] def runWithEnv(
+      name: String,
+      args: List[String],
+      state: ShellState
+  )(env: String => UIO[Option[String]]): IO[TabbyError, Value] = {
     for {
       result <- ZIO
         .attemptBlocking {
@@ -31,20 +41,20 @@ object External {
       (exit, stdout) = result
       value <-
         if (exit != 0) ZIO.fail(TabbyError.ExternalFailed(name, exit))
-        else formatWithAi(name, args, stdout, state)
+        else formatWithEnv(name, args, stdout, state)(env)
     } yield value
   }
 
-  private def formatWithAi(
+  private[tabbyshell] def formatWithEnv(
       name: String,
       args: List[String],
       stdout: String,
       state: ShellState
-  ): IO[TabbyError, Value] = {
+  )(env: String => UIO[Option[String]]): IO[TabbyError, Value] = {
     for {
-      disabledEnv <- ZSystem.env("TABBY_DISABLE_AI").orDie
-      apiKeyEnv <- ZSystem.env("OPENROUTER_API_KEY").orDie
-      baseUrlEnv <- ZSystem.env("OPENROUTER_BASE_URL").orDie
+      disabledEnv <- env("TABBY_DISABLE_AI")
+      apiKeyEnv <- env("OPENROUTER_API_KEY")
+      baseUrlEnv <- env("OPENROUTER_BASE_URL")
       value <- {
         val disabled = disabledEnv.exists(_.nonEmpty)
         val apiKey = apiKeyEnv.filter(_.nonEmpty)
@@ -98,13 +108,15 @@ object External {
     }
   }
 
-  private def fallback(stdout: String, reason: String, color: Boolean): UIO[Value] = {
+  private[tabbyshell] def fallbackMessage(reason: String, color: Boolean): String = {
     val message = s"(ai formatting unavailable: $reason)"
-    val styled = if (color) s"$esc[2m$message$esc[0m" else message
-    ZConsole.printLineError(styled).orDie.as(VStr(stdout.stripTrailing()))
+    if (color) s"$esc[2m$message$esc[0m" else message
   }
 
-  private def resolveUrl(baseUrl: Option[String]): String = {
+  private[tabbyshell] def fallback(stdout: String, reason: String, color: Boolean): UIO[Value] =
+    ZConsole.printLineError(fallbackMessage(reason, color)).orDie.as(VStr(stdout.stripTrailing()))
+
+  private[tabbyshell] def resolveUrl(baseUrl: Option[String]): String = {
     baseUrl match {
       case None =>
         "https://openrouter.ai/api/v1/chat/completions"
@@ -116,7 +128,11 @@ object External {
     }
   }
 
-  private def buildRequestBody(name: String, args: List[String], stdout: String): String = {
+  private[tabbyshell] def buildRequestBody(
+      name: String,
+      args: List[String],
+      stdout: String
+  ): String = {
     val systemPrompt =
       """You convert raw command output into structured data for a typed shell.
         |Reply with ONLY a JSON object, no prose, no markdown fences.
@@ -136,7 +152,7 @@ object External {
         .quote(systemPrompt)}},{"role":"user","content":${Json.quote(userPrompt)}}]}"""
   }
 
-  private def parseAiResponse(body: String): Either[String, Value] = {
+  private[tabbyshell] def parseAiResponse(body: String): Either[String, Value] = {
     val cleaned = stripFences(body)
     for {
       parsed <- Json.parse(cleaned)
@@ -193,12 +209,12 @@ object External {
     }
   }
 
-  private def getField(value: Value, name: String): Option[Value] = value match {
+  private[tabbyshell] def getField(value: Value, name: String): Option[Value] = value match {
     case VRecord(fields) => fields.find(_._1 == name).map(_._2)
     case _               => None
   }
 
-  private def stripFences(text: String): String = {
+  private[tabbyshell] def stripFences(text: String): String = {
     val trimmed = text.trim
     if (trimmed.startsWith("```")) {
       val firstNewline = trimmed.indexOf('\n')
