@@ -94,9 +94,10 @@ object CommandsSpec extends ZIOSpecDefault {
       home: Option[Path] = None,
       snapColor: Option[String] = None,
       noColorPresent: Boolean = true,
-      isTty: Boolean = false
+      isTty: Boolean = false,
+      snapDebug: Boolean = false
   ): Commands.CmdEnv =
-    Commands.CmdEnv(cwd, home, snapColor, noColorPresent, isTty)
+    Commands.CmdEnv(cwd, home, snapColor, noColorPresent, isTty, snapDebug)
 
   /** Runs the CLI in-process with captured streams; yields (exit code, stdout, stderr). */
   private def runCli(args: String*)(env: Commands.CmdEnv): UIO[(Int, String, String)] =
@@ -700,6 +701,43 @@ object CommandsSpec extends ZIOSpecDefault {
           parsed.map(_.patches.map(p => (p.author.value, p.revision))) ==
             Right(Vector("a@x" -> 1L, "a@x" -> 2L, "b@x" -> 1L)),
           parsed.map(_.patches(1).base.render) == Right("(a@x->1,b@x->1)")
+        )
+      }
+    },
+    test("commit fails with overflow error when frontier revision is at max (E1-S1)") {
+      ZIO.scoped {
+        for {
+          base <- tempDir("commit-overflow")
+          repoDir = base.resolve("repo")
+          _ <- ZIO.attemptBlocking(Files.createDirectories(repoDir)).orDie
+          _ <- writeText(repoDir.resolve("f.txt"), "modified\n")
+          contributor = ContributorId("a@x")
+          maxRev = Model.MaxSafeInteger
+          inMemoryRepo = Repository(
+            Version(Vector(contributor -> maxRev)),
+            Vector(
+              Patch(
+                contributor,
+                maxRev,
+                Version.empty,
+                "init",
+                Vector(Change.Text("f.txt", Vector(EditOp.Insert(Vector("original\n")))))
+              )
+            )
+          )
+          result <- Commands
+            .commitWithRepo(
+              repoDir,
+              inMemoryRepo,
+              contributor,
+              "next",
+              Render.Presentation.Plain
+            )
+            .either
+          repoFileWritten <- exists(repoDir.resolve(".snap").resolve("repository.json"))
+        } yield assertTrue(
+          result == Left(SnapError.NotPositiveSafeInteger("revision")),
+          !repoFileWritten
         )
       }
     }

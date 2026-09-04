@@ -199,24 +199,19 @@ object Render {
         sb.append(s"+++ ${diffSide(t.path, t.newPresent, "b")}\n")
         val (oldCount, newCount) = tokenCounts(t.oldTokens, t.edit)
         sb.append(s"@@ -1,$oldCount +1,$newCount @@\n")
-        var oldIndex = 0
-        t.edit.foreach {
-          case EditOp.Retain(n) =>
-            var k = 0L
-            while (k < n) {
-              sb.append(tokenLine(" ", t.oldTokens(oldIndex)))
-              oldIndex += 1
-              k += 1
-            }
-          case EditOp.Delete(n) =>
-            var k = 0L
-            while (k < n) {
-              sb.append(tokenLine("-", t.oldTokens(oldIndex)))
-              oldIndex += 1
-              k += 1
-            }
-          case EditOp.Insert(tokens) =>
-            tokens.foreach(tok => sb.append(tokenLine("+", tok)))
+        // H2: foldLeft over the edit script, threading the old-token cursor instead of while loops.
+        t.edit.foldLeft(0) { (oldIndex, op) =>
+          op match {
+            case EditOp.Retain(n) =>
+              (0L until n).foreach(k => sb.append(tokenLine(" ", t.oldTokens(oldIndex + k.toInt))))
+              oldIndex + n.toInt
+            case EditOp.Delete(n) =>
+              (0L until n).foreach(k => sb.append(tokenLine("-", t.oldTokens(oldIndex + k.toInt))))
+              oldIndex + n.toInt
+            case EditOp.Insert(tokens) =>
+              tokens.foreach(tok => sb.append(tokenLine("+", tok)))
+              oldIndex
+          }
         }
         sb.result()
     }
