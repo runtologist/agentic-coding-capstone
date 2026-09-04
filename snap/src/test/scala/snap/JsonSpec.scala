@@ -1,249 +1,408 @@
 package snap
 
 import zio.test.*
-import zio.json.ast.{Json => ZJson}
-
-import java.math.{BigDecimal => JBigDecimal}
 
 object JsonSpec extends ZIOSpecDefault {
+
+  // Golden bytes for the served repository snapshot (test 12 body_text_equals).
+  private val test12Golden: String = Vector(
+    "{",
+    "  \"format\": 1,",
+    "  \"frontier\": [",
+    "    [",
+    "      \"a@x\",",
+    "      1",
+    "    ]",
+    "  ],",
+    "  \"patches\": [",
+    "    {",
+    "      \"author\": \"a@x\",",
+    "      \"revision\": 1,",
+    "      \"base\": [],",
+    "      \"message\": \"one\",",
+    "      \"changes\": [",
+    "        {",
+    "          \"type\": \"text\",",
+    "          \"path\": \"file.txt\",",
+    "          \"edit\": [",
+    "            {",
+    "              \"insert\": [",
+    "                \"one\\n\"",
+    "              ]",
+    "            }",
+    "          ]",
+    "        }",
+    "      ]",
+    "    }",
+    "  ]",
+    "}"
+  ).mkString("\n") + "\n"
+
+  // Compact valid repository used across tests (one text change inserting "one\n").
+  private val compactRepo =
+    """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"one","changes":[{"type":"text","path":"file.txt","edit":[{"insert":["one\n"]}]}]}]}"""
 
   private def leftDetail[A](e: Either[SnapError, A]): Option[String] =
     e.left.toOption.map(_.detail)
 
-  private def parseOk(input: String): Json.Value =
-    Json.parseStrict(input, "t").toOption.get
+  private def parseOk(input: String): Model.Repository =
+    Json.parseRepository(input).toOption.get
 
-  def spec = suite("Json (zio-json backed)")(
-    suite("parseStrict: scalars and values")(
-      test("parses null, booleans, and strings") {
+  def spec = suite("Json thin zio-json codecs")(
+    suite("parseRepository: valid documents & golden round-trip")(
+      test("parses the compact test-12 repository into typed Model values") {
+        val r = Json.parseRepository(compactRepo)
         assertTrue(
-          Json.parseStrict("null", "t") == Right(Json.nul),
-          Json.parseStrict("true", "t") == Right(Json.bool(true)),
-          Json.parseStrict("false", "t") == Right(Json.bool(false)),
-          Json.parseStrict("\"hi\"", "t") == Right(Json.str("hi"))
-        )
-      },
-      test("parses numbers into BigDecimal preserving value and scale") {
-        val v = Json
-          .asObject(parseOk("""{"a":1,"b":1.5,"c":1e2,"big":9007199254740991}"""), "root")
-          .toOption
-          .get
-        val a = Json.asNumber(v.get("a").get, "a").toOption.get
-        val b = Json.asNumber(v.get("b").get, "b").toOption.get
-        val c = Json.asNumber(v.get("c").get, "c").toOption.get
-        val big = Json.asNumber(v.get("big").get, "big").toOption.get
-        assertTrue(
-          a.compareTo(new JBigDecimal("1")) == 0,
-          a.scale == 0,
-          b.compareTo(new JBigDecimal("1.5")) == 0,
-          c.compareTo(new JBigDecimal("100")) == 0,
-          big.longValueExact == 9007199254740991L
-        )
-      },
-      test("preserves object key order") {
-        val v = Json.asObject(parseOk("""{"b":1,"a":2}"""), "root").toOption.get
-        assertTrue(v.fields.map(_._1).toList == List("b", "a"))
-      },
-      test("parses string escapes") {
-        val jsonText = "\"a\\nb\\t\\\"c\\\"\\\\\\/\\b\\f\\ré\""
-        assertTrue(Json.parseStrict(jsonText, "t") == Right(Json.str("a\nb\t\"c\"\\/\b\f\ré")))
-      },
-      test("parses unicode escapes") {
-        assertTrue(Json.parseStrict("\"\\u00e9\"", "t") == Right(Json.str("é")))
-      },
-      test("rejects unescaped control characters in strings") {
-        assertTrue(Json.parseStrict("\"a\u0001b\"", "t").isLeft)
-      },
-      test("rejects malformed documents") {
-        assertTrue(
-          Json.parseStrict("", "t").isLeft,
-          Json.parseStrict("{", "t").isLeft,
-          Json.parseStrict("[1,2", "t").isLeft,
-          Json.parseStrict("tru", "t").isLeft,
-          Json.parseStrict("""{"a":}""", "t").isLeft,
-          Json.parseStrict("[1,2,]", "t").isLeft,
-          Json.parseStrict("{,}", "t").isLeft,
-          Json.parseStrict("\"\\x\"", "t").isLeft
-        )
-      },
-      test("malformed errors carry the source label and 'invalid JSON' substring") {
-        assertTrue(
-          leftDetail(Json.parseStrict("{", "repo.json")).exists(d =>
-            d.startsWith("invalid JSON: repo.json:")
+          r.isRight,
+          r.toOption.get.frontier.components.map { case (id, rev) => (id.value, rev) } ==
+            Vector(("a@x", 1L)),
+          r.toOption.get.patches.length == 1,
+          r.toOption.get.patches.head.author.value == "a@x",
+          r.toOption.get.patches.head.revision == 1L,
+          r.toOption.get.patches.head.base.isEmpty,
+          r.toOption.get.patches.head.message == "one",
+          r.toOption.get.patches.head.changes == Vector(
+            Model.Change.Text("file.txt", Vector(Model.EditOp.Insert(Vector("one\n"))))
           )
+        )
+      },
+      test("writeRepository reproduces the test-12 snapshot bytes exactly") {
+        val repo = parseOk(compactRepo)
+        assertTrue(Json.writeRepository(repo) == test12Golden)
+      },
+      test("parse(write(repo)) round-trips to a structurally equal repository") {
+        val repo = parseOk(compactRepo)
+        assertTrue(Json.parseRepository(Json.writeRepository(repo)) == Right(repo))
+      },
+      test("accepts pretty whitespace and shuffled object key order (typed-value identity)") {
+        val shuffled =
+          """{ "patches": [ { "changes": [{"edit": [{"insert": ["one\n"]}], "path": "file.txt", "type": "text"}], "message": "one", "base": [], "revision": 1, "author": "a@x" } ], "frontier": [["a@x", 1]], "format": 1 }"""
+        val a = parseOk(compactRepo)
+        val b = parseOk(shuffled)
+        assertTrue(
+          a.frontier == b.frontier,
+          a.patches.length == b.patches.length,
+          Model.Patch.sameValue(a.patches.head, b.patches.head)
+        )
+      },
+      test("accepts trailing whitespace after the top-level value") {
+        assertTrue(Json.parseRepository(compactRepo + " \n\t ").isRight)
+      },
+      test("parses put change with canonical base64 and delete change") {
+        val putRepo =
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"put","path":"img.bin","content":"AAEC"}]}]}"""
+        val delRepo =
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"delete","path":"gone.txt"}]}]}"""
+        val p = Json.parseRepository(putRepo).toOption.get.patches.head.changes.head
+        val d = Json.parseRepository(delRepo).toOption.get.patches.head.changes.head
+        assertTrue(
+          p match {
+            case Model.Change.Put("img.bin", bytes) => bytes.sameElements(Array[Byte](0, 1, 2))
+            case _                                  => false
+          },
+          d == Model.Change.Del("gone.txt")
         )
       }
     ),
-    suite("parseStrict: duplicate keys")(
-      test("rejects duplicate object keys at top level with the key name") {
-        val r = Json.parseStrict("""{"format":1,"format":1}""", "t")
+    suite("parseRepository: malformed JSON")(
+      test("rejects malformed documents with InvalidJson") {
+        assertTrue(
+          Json.parseRepository("").isLeft,
+          Json.parseRepository("{").isLeft,
+          Json.parseRepository("[1,2").isLeft,
+          Json.parseRepository("tru").isLeft,
+          Json.parseRepository("""{"a":}""").isLeft,
+          Json.parseRepository("[1,2,]").isLeft,
+          Json.parseRepository("{,}").isLeft,
+          Json.parseRepository("\"\\x\"").isLeft,
+          Json.parseRepository("not json").isLeft
+        )
+      },
+      test("malformed errors carry the 'invalid JSON' substring") {
+        assertTrue(
+          leftDetail(Json.parseRepository("{")).exists(_.contains("invalid JSON")),
+          leftDetail(Json.parseRepository("not json")).exists(_.contains("invalid JSON"))
+        )
+      },
+      test("rejects non-object top-level repository") {
+        assertTrue(
+          Json.parseRepository("[1,2]").isLeft,
+          Json.parseRepository("\"hello\"").isLeft
+        )
+      }
+    ),
+    suite("strict trailing content")(
+      test("rejects trailing non-whitespace after the repository value") {
+        assertTrue(
+          Json.parseRepository(compactRepo + "}").isLeft,
+          Json.parseRepository(compactRepo + " extra").isLeft,
+          Json.parseRepository(compactRepo + """{"format":1}""").isLeft,
+          leftDetail(Json.parseRepository(compactRepo + " x")).exists(_.contains("invalid JSON"))
+        )
+      }
+    ),
+    suite("duplicate object keys")(
+      test("rejects duplicate root key with the offending key name") {
+        val r = Json.parseRepository("""{"format":1,"format":1,"frontier":[],"patches":[]}""")
         assertTrue(r == Left(SnapError.DuplicateJsonKey("format")))
       },
-      test("rejects duplicate keys at nested depth") {
-        val r = Json.parseStrict("""{"a":{"x":1,"x":2}}""", "t")
-        assertTrue(r == Left(SnapError.DuplicateJsonKey("x")))
+      test("rejects duplicate keys inside a patch") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[],"patches":[{"author":"a@x","author":"b@x","revision":1,"base":[],"message":"m","changes":[{"type":"delete","path":"f"}]}]}"""
+        )
+        assertTrue(r == Left(SnapError.DuplicateJsonKey("author")))
+      },
+      test("rejects duplicate keys inside a change") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"delete","path":"f","path":"g"}]}]}"""
+        )
+        assertTrue(r == Left(SnapError.DuplicateJsonKey("path")))
+      },
+      test("rejects duplicate keys inside an edit op") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"text","path":"f","edit":[{"retain":1,"retain":2}]}]}]}"""
+        )
+        assertTrue(r == Left(SnapError.DuplicateJsonKey("retain")))
       },
       test("allows identical keys in sibling objects") {
-        assertTrue(Json.parseStrict("""{"a":{"x":1},"b":{"x":2}}""", "t").isRight)
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1],["b@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"delete","path":"x"}]},{"author":"b@x","revision":1,"base":[["a@x",1]],"message":"m2","changes":[{"type":"delete","path":"y"}]}]}"""
+        )
+        assertTrue(r.isRight)
       }
     ),
-    suite("trailing content")(
-      test("strict mode rejects trailing non-whitespace after the first value") {
+    suite("unknown fields")(
+      test("rejects unknown repository field with exact pinned message") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[],"patches":[],"unknown":true}"""
+        )
         assertTrue(
-          Json.parseStrict("""{"a":1}}""", "t").isLeft,
-          Json.parseStrict("""{"a":1} extra""", "t").isLeft,
-          Json.parseStrict("""{"a":1}{"b":2}""", "t").isLeft,
-          leftDetail(Json.parseStrict("""{"a":1} x""", "t")).exists(_.contains("invalid JSON"))
+          r == Left(SnapError.UnknownRepoField("unknown")),
+          leftDetail(r).contains("repository has unknown field: unknown")
         )
       },
-      test("strict mode allows trailing whitespace") {
-        assertTrue(Json.parseStrict("{\"a\":1} \n\t ", "t").isRight)
-      },
-      test("config mode tolerates trailing bytes after the first complete value (test 03)") {
-        val r = Json.parseConfig("""{"contributor":{"id":"global@example.com"}}}}""", "cfg")
-        val ok = r.toOption
-          .flatMap(j => Json.asObject(j, "cfg").toOption)
-          .flatMap(o => o.get("contributor"))
-          .isDefined
-        assertTrue(r.isRight, ok)
-      },
-      test("config mode still rejects unparseable leading content") {
-        assertTrue(Json.parseConfig("not json", "cfg").isLeft)
-      },
-      test("config mode still rejects duplicate keys") {
-        val r = Json.parseConfig("""{"contributor":{"id":"a@x","id":"b@x"}}""", "cfg")
-        assertTrue(r == Left(SnapError.DuplicateJsonKey("id")))
-      }
-    ),
-    suite("typed extraction helpers")(
-      test("asObject/asArray/asString/asBoolean succeed on matching types") {
-        val v = parseOk("""{"a":[1,"x",true,null]}""")
-        val obj = Json.asObject(v, "root").toOption.get
-        assertTrue(
-          Json.asArray(obj.get("a").get, "a").isRight,
-          Json.asString(Json.arr(Json.str("x")).asInstanceOf[ZJson.Arr].elements.head, "x").isRight,
-          Json.asBoolean(ZJson.Bool(true), "f") == Right(true),
-          Json.asString(ZJson.Str("hi"), "m") == Right("hi")
+      test("rejects unknown patch field") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"delete","path":"f"}],"extra":1}]}"""
         )
+        assertTrue(r.isLeft, leftDetail(r).exists(_.contains("unknown field: extra")))
       },
-      test("type mismatches produce InvalidJson with context") {
-        val v = parseOk("""{"a":1}""")
-        assertTrue(
-          leftDetail(Json.asArray(v, "frontier")).exists(_.contains("frontier")),
-          Json.asString(ZJson.Num(new JBigDecimal("1")), "message").isLeft,
-          Json.asBoolean(ZJson.Null, "format").isLeft,
-          Json.asObject(ZJson.Arr(zio.Chunk.empty), "repository").isLeft
+      test("rejects unknown change field with pinned substring") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"put","path":"f","content":"YQ==","extra":1}]}]}"""
         )
+        assertTrue(r.isLeft, leftDetail(r).exists(_.endsWith("unknown field: extra")))
       },
-      test("field reports missing fields and optionalField returns None") {
-        val o = Json.asObject(parseOk("""{"a":1}"""), "root").toOption.get
+      test("rejects missing required fields") {
         assertTrue(
-          Json.field(o, "b", "repository").isLeft,
-          Json.field(o, "a", "repository").isRight,
-          Json.optionalField(o, "b").isEmpty,
-          Json.optionalField(o, "a").isDefined
-        )
-      },
-      test("unknownFields lists distinct unknown keys in first-seen order") {
-        val dup = Json.parseStrict("""{"format":1,"unknown":true,"extra":2,"format":1}""", "r")
-        // duplicate key makes strict parse fail, so use a unique-key object
-        val o2 =
-          Json.asObject(parseOk("""{"format":1,"unknown":true,"extra":2}"""), "r").toOption.get
-        assertTrue(
-          dup == Left(SnapError.DuplicateJsonKey("format")),
-          Json.unknownFields(o2, Set("format")) == Vector("unknown", "extra")
-        )
-      },
-      test("asNumber returns the raw BigDecimal and rejects non-numbers") {
-        val n = Json.asNumber(parseOk("42"), "n").toOption.get
-        assertTrue(
-          n.compareTo(new JBigDecimal("42")) == 0,
-          Json.asNumber(ZJson.Str("42"), "n").isLeft
-        )
-      }
-    ),
-    suite("writeCanonical")(
-      test("empty containers render inline") {
-        assertTrue(
-          Json.writeCanonical(Json.obj()) == "{}\n",
-          Json.writeCanonical(Json.arr()) == "[]\n"
-        )
-      },
-      test("string escaping matches JSON.stringify") {
-        assertTrue(Json.writeCanonical(Json.str("a\nb")) == "\"a\\nb\"\n")
-      },
-      test("escapes control characters as lowercase \\u00xx") {
-        val s = "x" + 1.toChar + "y"
-        assertTrue(Json.writeCanonical(Json.str(s)) == "\"x\\u0001y\"\n")
-      },
-      test("integer-valued numbers render without fraction or exponent") {
-        assertTrue(
-          Json.writeCanonical(Json.num(1L)) == "1\n",
-          Json.writeCanonical(ZJson.Num(new JBigDecimal("1e2"))) == "100\n",
-          Json.writeCanonical(ZJson.Num(new JBigDecimal("1.0"))) == "1\n",
-          Json.writeCanonical(ZJson.Num(new JBigDecimal("0.0"))) == "0\n",
-          Json.writeCanonical(ZJson.Num(new JBigDecimal("1.5"))) == "1.5\n"
-        )
-      },
-      test("renders the test-12 served-snapshot bytes exactly") {
-        val repo = Json.obj(
-          "format" -> Json.num(1L),
-          "frontier" -> Json.arr(Json.arr(Json.str("a@x"), Json.num(1L))),
-          "patches" -> Json.arr(
-            Json.obj(
-              "author" -> Json.str("a@x"),
-              "revision" -> Json.num(1L),
-              "base" -> Json.arr(),
-              "message" -> Json.str("one"),
-              "changes" -> Json.arr(
-                Json.obj(
-                  "type" -> Json.str("text"),
-                  "path" -> Json.str("file.txt"),
-                  "edit" -> Json.arr(Json.obj("insert" -> Json.arr(Json.str("one\n"))))
-                )
-              )
+          Json.parseRepository("""{"frontier":[],"patches":[]}""").isLeft,
+          Json.parseRepository("""{"format":1,"patches":[]}""").isLeft,
+          Json.parseRepository("""{"format":1,"frontier":[]}""").isLeft,
+          Json
+            .parseRepository(
+              """{"format":1,"frontier":[],"patches":[{"revision":1,"base":[],"message":"m","changes":[{"type":"delete","path":"f"}]}]}"""
             )
-          )
+            .isLeft
         )
-        val expected = Vector(
-          "{",
-          "  \"format\": 1,",
-          "  \"frontier\": [",
-          "    [",
-          "      \"a@x\",",
-          "      1",
-          "    ]",
-          "  ],",
-          "  \"patches\": [",
-          "    {",
-          "      \"author\": \"a@x\",",
-          "      \"revision\": 1,",
-          "      \"base\": [],",
-          "      \"message\": \"one\",",
-          "      \"changes\": [",
-          "        {",
-          "          \"type\": \"text\",",
-          "          \"path\": \"file.txt\",",
-          "          \"edit\": [",
-          "            {",
-          "              \"insert\": [",
-          "                \"one\\n\"",
-          "              ]",
-          "            }",
-          "          ]",
-          "        }",
-          "      ]",
-          "    }",
-          "  ]",
-          "}"
-        ).mkString("\n") + "\n"
-        assertTrue(Json.writeCanonical(repo) == expected)
       },
-      test("round-trips parsed values") {
-        val compact =
-          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"one","changes":[{"type":"text","path":"file.txt","edit":[{"insert":["one\n"]}]}]}]}"""
-        val v = parseOk(compact)
-        assertTrue(Json.parseStrict(Json.writeCanonical(v), "rt") == Right(v))
+      test("rejects wrong format value and wrong format type") {
+        assertTrue(
+          Json.parseRepository("""{"format":2,"frontier":[],"patches":[]}""").isLeft,
+          Json.parseRepository("""{"format":"1","frontier":[],"patches":[]}""").isLeft
+        )
+      }
+    ),
+    suite("integer literal strictness")(
+      test("rejects fractional revision with positive safe integer error") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1.5,"base":[],"message":"m","changes":[{"type":"delete","path":"f"}]}]}"""
+        )
+        assertTrue(r.isLeft, leftDetail(r).exists(_.endsWith("positive safe integer")))
+      },
+      test("rejects zero and negative and over-max revisions") {
+        def repoWith(rev: String) =
+          s"""{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":$rev,"base":[],"message":"m","changes":[{"type":"delete","path":"f"}]}]}"""
+        assertTrue(
+          Json.parseRepository(repoWith("0")).isLeft,
+          Json.parseRepository(repoWith("-1")).isLeft,
+          Json.parseRepository(repoWith("9007199254740992")).isLeft
+        )
+      },
+      test("accepts 1 and the max safe integer") {
+        def repoWith(rev: String) =
+          s"""{"format":1,"frontier":[["a@x",$rev]],"patches":[{"author":"a@x","revision":$rev,"base":[],"message":"m","changes":[{"type":"delete","path":"f"}]}]}"""
+        assertTrue(
+          Json.parseRepository(repoWith("1")).isRight,
+          Json.parseRepository(repoWith("9007199254740991")).isRight
+        )
+      },
+      test("rejects zero retain count and string-typed count") {
+        assertTrue(
+          Json
+            .parseRepository(
+              """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"text","path":"f","edit":[{"retain":0}]}]}]}"""
+            )
+            .left
+            .toOption
+            .exists(_.detail.endsWith("positive safe integer")),
+          Json
+            .parseRepository(
+              """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"text","path":"f","edit":[{"retain":"1"}]}]}]}"""
+            )
+            .isLeft
+        )
+      }
+    ),
+    suite("base64 canonicality")(
+      test("rejects unpadded, non-alphabet, and non-canonical trailing-bit content") {
+        def putRepo(content: String) =
+          s"""{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"put","path":"f","content":"$content"}]}]}"""
+        assertTrue(
+          leftDetail(Json.parseRepository(putRepo("abc"))).exists(_.contains("canonical base64")),
+          leftDetail(Json.parseRepository(putRepo("YQ"))).exists(_.contains("canonical base64")),
+          leftDetail(Json.parseRepository(putRepo("!!=="))).exists(_.contains("canonical base64")),
+          leftDetail(Json.parseRepository(putRepo("AB=="))).exists(_.contains("canonical base64"))
+        )
+      },
+      test("accepts canonical padded base64 and round-trips bytes") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"put","path":"f","content":"YQBi"}]}]}"""
+        )
+        val bytes = r.toOption.get.patches.head.changes.head
+          .asInstanceOf[Model.Change.Put]
+          .bytes
+        assertTrue(new String(bytes, "UTF-8") == "a\u0000b")
+      }
+    ),
+    suite("edit op shape")(
+      test("rejects an edit op with two operation keys") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"text","path":"f","edit":[{"retain":1,"delete":1}]}]}]}"""
+        )
+        assertTrue(r.isLeft, leftDetail(r).exists(_.contains("must have one operation")))
+      },
+      test("rejects an edit op with an unknown operation key") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"text","path":"f","edit":[{"foo":1}]}]}]}"""
+        )
+        assertTrue(r.isLeft, leftDetail(r).exists(_.contains("must have one operation")))
+      },
+      test("rejects an empty insert array") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"text","path":"f","edit":[{"insert":[]}]}]}]}"""
+        )
+        assertTrue(r.isLeft, leftDetail(r).exists(_.endsWith("insert is empty")))
+      },
+      test("rejects non-canonical insert tokens") {
+        // interior LF inside a token
+        val interior = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"text","path":"f","edit":[{"insert":["a\nb"]}]}]}]}"""
+        )
+        // empty token
+        val emptyTok = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"text","path":"f","edit":[{"insert":[""]}]}]}]}"""
+        )
+        assertTrue(interior.isLeft, emptyTok.isLeft)
+      },
+      test("accepts an empty edit script (empty file creation)") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"text","path":"f","edit":[]}]}]}"""
+        )
+        assertTrue(
+          r.isRight,
+          r.toOption.get.patches.head.changes.head == Model.Change.Text("f", Vector.empty)
+        )
+      }
+    ),
+    suite("message and path validation")(
+      test("rejects empty patch message") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"","changes":[{"type":"delete","path":"f"}]}]}"""
+        )
+        assertTrue(r.isLeft, leftDetail(r).exists(_.endsWith("message is empty")))
+      },
+      test("rejects forbidden control character in message") {
+        val r = Json.parseRepository(
+          "{\"format\":1,\"frontier\":[[\"a@x\",1]],\"patches\":[{\"author\":\"a@x\",\"revision\":1,\"base\":[],\"message\":\"bad" + 1.toChar + "msg\",\"changes\":[{\"type\":\"delete\",\"path\":\"f\"}]}]}"
+        )
+        assertTrue(r.isLeft)
+      },
+      test("rejects .snap path, backslash, control char, and bad segments") {
+        def putRepo(path: String) =
+          s"""{"format":1,"frontier":[["a@x",1]],"patches":[{"author":"a@x","revision":1,"base":[],"message":"m","changes":[{"type":"put","path":"$path","content":"YQ=="}]}]}"""
+        assertTrue(
+          leftDetail(Json.parseRepository(putRepo(".snap/secret")))
+            .exists(_.contains("path is invalid")),
+          Json.parseRepository(putRepo("a\\\\b")).isLeft,
+          Json.parseRepository(putRepo("a//b")).isLeft,
+          Json.parseRepository(putRepo("./a")).isLeft,
+          Json.parseRepository(putRepo("")).isLeft
+        )
+      }
+    ),
+    suite("version vectors")(
+      test("rejects non-canonical frontier ordering") {
+        val r =
+          Json.parseRepository("""{"format":1,"frontier":[["b@x",1],["a@x",1]],"patches":[]}""")
+        assertTrue(r.isLeft, leftDetail(r).exists(_.contains("canonical")))
+      },
+      test("rejects duplicate contributor in frontier") {
+        val r =
+          Json.parseRepository("""{"format":1,"frontier":[["a@x",1],["a@x",2]],"patches":[]}""")
+        assertTrue(r.isLeft)
+      },
+      test("rejects invalid contributor id in frontier") {
+        val r = Json.parseRepository("""{"format":1,"frontier":[["not-an-id",1]],"patches":[]}""")
+        assertTrue(r.isLeft, leftDetail(r).exists(_.contains("invalid contributor id")))
+      },
+      test("rejects malformed frontier pair shape") {
+        assertTrue(
+          Json.parseRepository("""{"format":1,"frontier":[["a@x"]],"patches":[]}""").isLeft,
+          Json.parseRepository("""{"format":1,"frontier":[[1,2]],"patches":[]}""").isLeft,
+          Json.parseRepository("""{"format":1,"frontier":["a@x"],"patches":[]}""").isLeft
+        )
+      },
+      test("rejects non-canonical base ordering") {
+        val r = Json.parseRepository(
+          """{"format":1,"frontier":[["a@x",1],["b@x",1]],"patches":[{"author":"a@x","revision":1,"base":[["b@x",1],["a@x",1]],"message":"m","changes":[{"type":"delete","path":"f"}]}]}"""
+        )
+        assertTrue(r.isLeft)
+      }
+    ),
+    suite("parseConfig")(
+      test("parses a valid config and returns the contributor id") {
+        val r = Json.parseConfig("""{"contributor":{"id":"alice@example.com"}}""")
+        assertTrue(r.isRight, r.toOption.get.id.value == "alice@example.com")
+      },
+      test("tolerates trailing bytes after the first complete value (test 03)") {
+        val r = Json.parseConfig("""{"contributor":{"id":"global@example.com"}}}}""")
+        assertTrue(r.isRight, r.toOption.get.id.value == "global@example.com")
+      },
+      test("rejects unparseable config with invalid JSON") {
+        val r = Json.parseConfig("not json")
+        assertTrue(r.isLeft, leftDetail(r).exists(_.contains("invalid JSON")))
+      },
+      test("rejects duplicate config keys") {
+        val r = Json.parseConfig("""{"contributor":{"id":"a@x","id":"b@x"}}""")
+        assertTrue(r == Left(SnapError.DuplicateJsonKey("id")))
+      },
+      test("rejects invalid contributor id") {
+        val r = Json.parseConfig("""{"contributor":{"id":"not-an-id"}}""")
+        assertTrue(r.isLeft, leftDetail(r).exists(_.contains("invalid contributor id")))
+      },
+      test("rejects unknown config fields and bad shape") {
+        assertTrue(
+          Json.parseConfig("""{"contributor":{"id":"a@x"},"unknown":true}""").isLeft,
+          Json.parseConfig("""{"contributor":"a@x"}""").isLeft,
+          Json.parseConfig("""{}""").isLeft,
+          Json.parseConfig("""{"contributor":{}}""").isLeft
+        )
+      },
+      test("writeConfig emits canonical two-space JSON with trailing LF") {
+        val cfg = Json.ConfigFile(Model.ContributorId.parse("a@x").toOption.get)
+        assertTrue(
+          Json.writeConfig(cfg) == "{\n  \"contributor\": {\n    \"id\": \"a@x\"\n  }\n}\n"
+        )
       }
     )
   )
