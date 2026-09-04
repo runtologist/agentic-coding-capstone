@@ -23,7 +23,7 @@ object Jnu {
       try
         Option(getClass.getProtectionDomain.getCodeSource)
           .flatMap(cs => Option(cs.getLocation))
-          .map(_.getPath)
+          .map(l => java.nio.file.Paths.get(l.toURI).toString)
       catch { case _: Throwable => None }
 
     val encodingIsUtf8 = jnuEncoding match {
