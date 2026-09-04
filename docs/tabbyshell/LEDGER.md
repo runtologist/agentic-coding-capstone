@@ -37,6 +37,10 @@ exempt from dedicated tests; smart constructors are not).
 
 ## Coverage wave 1 (dispatched 2026-09-04)
 
+Dispatched as async pi-subagents workflow `47fd5361-c271-4f86-b86c-8482f59d91c3`
+(mission `0771c413-b6a2-45b8-b58f-c10da05c1573`), five fresh-context worker
+lanes in managed worktrees, global concurrency limit 3.
+
 One worktree lane per module, disjoint file ownership, no build-file edits,
 no behavior changes. Lane gates: `compile`, `test`, `scalafmtAll;
 scalafmtCheckAll`, then `sbt --client shutdown`.
