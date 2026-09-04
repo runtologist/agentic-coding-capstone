@@ -219,7 +219,7 @@ object Executor {
     }
   }
 
-  private def compareForWhere(
+  private[tabbyshell] def compareForWhere(
       cell: Value,
       literal: Value,
       op: String
@@ -534,7 +534,7 @@ object Executor {
   private def externalArgs(args: List[Arg]): List[String] =
     args.map(externalArgString)
 
-  private def externalArgString(arg: Arg): String = arg match {
+  private[tabbyshell] def externalArgString(arg: Arg): String = arg match {
     case Arg.Bare(value) => value
     case Arg.Op(value)   => value
     case Arg.Dash        => "-"
@@ -547,7 +547,7 @@ object Executor {
       }
   }
 
-  private def literalToRawString(literal: Literal): String = literal match {
+  private[tabbyshell] def literalToRawString(literal: Literal): String = literal match {
     case Literal.LStr(value)   => value
     case Literal.LInt(value)   => value.toString
     case Literal.LFloat(value) => value.toString
@@ -572,7 +572,7 @@ object Executor {
     case _            => None
   }
 
-  private def compareNumeric(a: Value, b: Value): Int = (a, b) match {
+  private[tabbyshell] def compareNumeric(a: Value, b: Value): Int = (a, b) match {
     case (VInt(x), VInt(y))           => java.lang.Long.compare(x, y)
     case (VFilesize(x), VFilesize(y)) => java.lang.Long.compare(x, y)
     case (VInt(x), VFilesize(y))      => java.lang.Long.compare(x, y)
@@ -705,7 +705,7 @@ object Executor {
     }
   }
 
-  private def clampToInt(value: Long): Int = {
+  private[tabbyshell] def clampToInt(value: Long): Int = {
     if (value > Int.MaxValue.toLong) Int.MaxValue
     else if (value < Int.MinValue.toLong) Int.MinValue
     else value.toInt
