@@ -20,18 +20,25 @@ import snap.Model.EditOp
   * operations of the same kind are coalesced. The recurrence and the deletion-on-tie rule define
   * the exact output, including for repeated equal lines.
   *
-  * Implementation: costs are computed bottom-up with two rolling rows while a one-byte-per-cell
-  * decision table records the walk choice, giving the exact spec walk in O(n·m) time and ~1 byte
-  * per cell instead of a full int table.
+  * Implementation notes:
+  *   - Small inputs use a dense bottom-up decision table (the original strategy).
+  *   - Large inputs use a block-based linear-space replay: suffix-cost rows are computed bottom-up,
+  *     checkpointed every `BlockSize` rows, and each block is re-materialised (O(m) rolling arrays)
+  *     just before the spec walk replays through it. Space is O(m·√n), time stays O(n·m), and
+  *     because the walk decisions are evaluated against the exact §5 suffix costs, the emitted
+  *     script is byte-identical to the dense-table walk for every input.
   */
 object Diff {
-
-  /** Decision-table size cap (cells). 64M cells ≈ 64 MB decision table + O(m) cost rows. */
-  private val MaxDiffCells: Long = 64000000L
 
   private final val Diag: Byte = 0
   private final val Down: Byte = 1 // delete one old token
   private final val Right: Byte = 2 // insert one new token
+
+  /** Subproblems with at most this many cells use the dense decision table. */
+  private val DenseThreshold: Long = 2048L
+
+  /** Row-block height for the linear-space replay; √n balances checkpoint storage vs recompute. */
+  private def blockSize(n: Int): Int = math.max(1, math.sqrt(n.toDouble).toInt)
 
   /** SPEC §5 canonical diff, coalesced. */
   def canonicalDiff(oldTokens: Vector[String], newTokens: Vector[String]): Vector[EditOp] = {
@@ -47,46 +54,88 @@ object Diff {
       if (a.isEmpty && b.isEmpty) Vector.empty
       else if (a.isEmpty) Vector(EditOp.Insert(b))
       else if (b.isEmpty) Vector(EditOp.Delete(a.length.toLong))
-      else dpDiff(a, b)
+      else if (a.length.toLong * b.length.toLong <= DenseThreshold) denseWalk(a, b)
+      else blockedWalk(a, b)
 
     coalesce(if (prefix > 0) EditOp.Retain(prefix.toLong) +: body else body)
   }
 
   /** Merge adjacent operations of the same kind; drop zero-count or empty operations. */
   private[snap] def coalesce(ops: Vector[EditOp]): Vector[EditOp] = {
-    val buf = scala.collection.mutable.ArrayBuffer.empty[EditOp]
-    ops.foreach { op =>
-      val nonEmpty = op match {
-        case EditOp.Retain(n)      => n > 0
-        case EditOp.Delete(n)      => n > 0
-        case EditOp.Insert(tokens) => tokens.nonEmpty
-      }
-      if (nonEmpty) {
-        if (buf.isEmpty) buf += op
-        else
-          (buf.last, op) match {
-            case (EditOp.Retain(x), EditOp.Retain(y)) => buf(buf.length - 1) = EditOp.Retain(x + y)
-            case (EditOp.Delete(x), EditOp.Delete(y)) => buf(buf.length - 1) = EditOp.Delete(x + y)
-            case (EditOp.Insert(t1), EditOp.Insert(t2)) =>
-              buf(buf.length - 1) = EditOp.Insert(t1 ++ t2)
-            case _ => buf += op
-          }
+    def nonEmpty(op: EditOp): Boolean = op match {
+      case EditOp.Retain(n)      => n > 0
+      case EditOp.Delete(n)      => n > 0
+      case EditOp.Insert(tokens) => tokens.nonEmpty
+    }
+    ops.filter(nonEmpty).foldLeft(Vector.empty[EditOp]) { (acc, op) =>
+      (acc.lastOption, op) match {
+        case (Some(EditOp.Retain(x)), EditOp.Retain(y))   => acc.init :+ EditOp.Retain(x + y)
+        case (Some(EditOp.Delete(x)), EditOp.Delete(y))   => acc.init :+ EditOp.Delete(x + y)
+        case (Some(EditOp.Insert(t1)), EditOp.Insert(t2)) => acc.init :+ EditOp.Insert(t1 ++ t2)
+        case _                                            => acc :+ op
       }
     }
-    buf.toVector
   }
 
-  private def dpDiff(a: Vector[String], b: Vector[String]): Vector[EditOp] = {
+  /** One bottom-up suffix-cost row: `below` is D(i+1, ·); result is D(i, ·) over columns 0..m. */
+  private def computeSuffixRow(
+      a: Vector[String],
+      b: Vector[String],
+      n: Int,
+      m: Int,
+      i: Int,
+      below: Array[Int]
+  ): Array[Int] = {
+    val cur = new Array[Int](m + 1)
+    cur(m) = n - i // right edge: delete remaining old tokens
+    // Imperative inner loop: hot O(m) DP recurrence over primitive arrays.
+    var j = m - 1
+    while (j >= 0) {
+      if (a(i) == b(j)) cur(j) = below(j + 1)
+      else {
+        val del = below(j) // D(i + 1, j)
+        val ins = cur(j + 1) // D(i, j + 1)
+        cur(j) = (if (del <= ins) del else ins) + 1
+      }
+      j -= 1
+    }
+    cur
+  }
+
+  /** Emit the spec walk over a window of suffix-cost rows, advancing (i, j) in place. */
+  private def walkRows(
+      a: Vector[String],
+      b: Vector[String],
+      n: Int,
+      m: Int,
+      rows: Array[Array[Int]], // rows(r) = D(rowLo + r, ·)
+      rowLo: Int,
+      rowLim: Int, // walk rows [rowLo, rowLim)
+      pos: Array[Int], // pos(0) = i, pos(1) = j
+      ops: scala.collection.mutable.ArrayBuffer[EditOp]
+  ): Unit = {
+    var i = pos(0)
+    var j = pos(1)
+    while (i < rowLim && i < n && j < m) {
+      val li = i - rowLo
+      if (a(i) == b(j)) {
+        ops += EditOp.Retain(1L); i += 1; j += 1
+      } else if (rows(li + 1)(j) <= rows(li)(j + 1)) { // deletion wins ties (SPEC §5)
+        ops += EditOp.Delete(1L); i += 1
+      } else {
+        ops += EditOp.Insert(Vector(b(j))); j += 1
+      }
+    }
+    pos(0) = i
+    pos(1) = j
+  }
+
+  /** Dense bottom-up decision table + walk; used for small inputs (bounded memory). */
+  private def denseWalk(a: Vector[String], b: Vector[String]): Vector[EditOp] = {
     val n = a.length
     val m = b.length
     val w = m + 1
-    val cells = (n.toLong + 1L) * w.toLong
-    if (cells > MaxDiffCells)
-      throw new IllegalStateException(
-        s"Diff.dpDiff: token diff of $n x $m exceeds the $MaxDiffCells-cell budget"
-      )
-
-    val dec = new Array[Byte]((n + 1) * w)
+    val dec = new Array[Byte](n * w)
     val costNext = new Array[Int](w) // D(i + 1, *)
     val costCur = new Array[Int](w) // D(i, *)
 
@@ -94,7 +143,6 @@ object Diff {
     var j = 0
     while (j <= m) {
       costNext(j) = m - j
-      dec(n * w + j) = Right
       j += 1
     }
 
@@ -137,5 +185,49 @@ object Diff {
     if (i < n) ops += EditOp.Delete((n - i).toLong)
     if (j < m) ops += EditOp.Insert(b.drop(j))
     ops.result()
+  }
+
+  /** Linear-space replay of the spec walk for large inputs (no cell cap, O(m·√n) memory). */
+  private def blockedWalk(a: Vector[String], b: Vector[String]): Vector[EditOp] = {
+    val n = a.length
+    val m = b.length
+    val s = blockSize(n)
+
+    // Pass 1: bottom-up suffix costs; checkpoint every s-th row (plus row n).
+    // Imperative loop: single O(n·m) DP sweep over primitive arrays.
+    val checkpoints = scala.collection.mutable.HashMap.empty[Int, Array[Int]]
+    var below = Array.tabulate(m + 1)(j => m - j) // D(n, j) = m - j
+    checkpoints.update(n, below)
+    var i = n - 1
+    while (i >= 0) {
+      val cur = computeSuffixRow(a, b, n, m, i, below)
+      if (i % s == 0) checkpoints.update(i, cur)
+      below = cur
+      i -= 1
+    }
+
+    // Pass 2: replay the walk block by block, re-materialising each block's suffix rows
+    // from its lower checkpoint so only O(s·m) rows are live at any time.
+    val ops = scala.collection.mutable.ArrayBuffer.empty[EditOp]
+    val pos = Array(0, 0)
+    var blockLo = 0
+    while (pos(0) < n && pos(1) < m) {
+      blockLo = (pos(0) / s) * s
+      val blockHi = math.min(blockLo + s, n)
+      val height = blockHi - blockLo
+      val rows = new Array[Array[Int]](height + 1)
+      rows(height) = checkpoints(blockHi)
+      var r = blockHi - 1
+      while (r >= blockLo) {
+        rows(r - blockLo) = computeSuffixRow(a, b, n, m, r, rows(r - blockLo + 1))
+        r -= 1
+      }
+      walkRows(a, b, n, m, rows, blockLo, blockHi, pos, ops)
+    }
+
+    val (fi, fj) = (pos(0), pos(1))
+    if (fi < n) ops += EditOp.Delete((n - fi).toLong)
+    if (fj < m) ops += EditOp.Insert(b.drop(fj))
+    ops.toVector
   }
 }
