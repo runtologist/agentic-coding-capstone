@@ -2,352 +2,371 @@ package snap
 
 import zio.test.*
 
-import snap.Model
 import snap.Model.*
 import snap.Model.EditOp.*
 
-/** Unit tests for semantic repository validation (SPEC §4.5) pinned against CONTRACT §7 and the
-  * YAML suite (tests 15, 16, 23, 27).
+/** Unit tests for semantic repository validation (SPEC §4.5), pinned against the YAML suite error
+  * contracts (tests 15, 16, 23, 26, 27).
   */
 object CodecSpec extends ZIOSpecDefault {
 
-  private def id(s: String): ContributorId = ContributorId.parse(s).toOption.get
+  private def id(s: String): ContributorId =
+    ContributorId.parse(s).fold(e => throw new IllegalStateException(e.detail), identity)
 
   private def v(pairs: (String, Long)*): Version =
-    Version(pairs.map { case (a, r) => (id(a), r) }.toVector)
+    Version(
+      pairs
+        .map { case (a, r) => (id(a), r) }
+        .toVector
+        .sortWith((x, y) => Model.utf8Compare(x._1.value, y._1.value) < 0)
+    )
 
-  private def createText(path: String, content: String): Change =
-    if (content.isEmpty) Change.Text(path, Vector.empty)
-    else Change.Text(path, Vector(Insert(Model.tokenize(content))))
+  private def textCreate(path: String, content: String): Change.Text = {
+    val toks = Model.tokenize(content)
+    Change.Text(path, if (toks.isEmpty) Vector.empty else Vector(Insert(toks)))
+  }
 
-  private def editText(path: String, oldContent: String, newContent: String): Change =
+  private def textEdit(path: String, oldContent: String, newContent: String): Change.Text =
     Change.Text(path, Diff.canonicalDiff(Model.tokenize(oldContent), Model.tokenize(newContent)))
+
+  private def putText(path: String, content: String): Change.Put =
+    Change.Put(path, Model.utf8Bytes(content))
+
+  private def putBytes(path: String, bytes: Array[Byte]): Change.Put =
+    Change.Put(path, bytes)
+
+  private def del(path: String): Change.Del = Change.Del(path)
 
   private def patch(
       author: String,
       rev: Long,
       base: Version,
-      msg: String,
+      message: String,
       changes: Change*
-  ): Patch =
-    Patch(id(author), rev, base, msg, changes.toVector)
+  ): Patch = Patch(id(author), rev, base, message, changes.toVector)
 
   private def repo(frontier: Version, patches: Patch*): Repository =
     Repository(frontier, patches.toVector)
 
-  private def leftDetail(e: Either[SnapError, Unit]): String =
-    e.left.toOption.map(_.detail).getOrElse("")
+  private def assertError(r: Either[SnapError, Unit])(f: SnapError => Boolean): TestResult =
+    r match {
+      case Left(e)  => assertTrue(f(e))
+      case Right(_) => assertTrue(false)
+    }
 
-  // A minimal valid repository: one author, one text create.
-  private val validSingle =
-    repo(v("a@x" -> 1), patch("a@x", 1, Version.empty, "one", createText("f", "one\n")))
+  private val validSeed = patch("seed@x", 1, v(), "base", textCreate("notes.txt", "base\n"))
 
-  // Test-15 golden: two-revision chain creating then editing one file.
-  private val validChain = repo(
-    v("a@x" -> 2),
-    patch("a@x", 1, Version.empty, "base", createText("f", "one\ntwo\n")),
-    patch("a@x", 2, v("a@x" -> 1), "edit", editText("f", "one\ntwo\n", "two\nthree\n"))
-  )
-
-  // Test-05 golden: repeated.txt old `a\nb\na\n` -> new `b\na\na`, stored edit
-  // [{delete 1},{retain 2},{insert ["a"]}] (deletion-on-tie rule).
-  private val validRepeatedLines = repo(
-    v("a@x" -> 2),
-    patch("a@x", 1, Version.empty, "base", createText("repeated.txt", "a\nb\na\n")),
-    patch(
-      "a@x",
-      2,
-      v("a@x" -> 1),
-      "repeated",
-      Change.Text("repeated.txt", Vector(Delete(1), Retain(2), Insert(Vector("a"))))
-    )
+  /** Test-09 shaped repository: seed + two concurrent text edits, stored sorted by author. */
+  private val validMultiAuthor = repo(
+    v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1),
+    patch("alice@x", 1, v("seed@x" -> 1), "left", textEdit("notes.txt", "base\n", "base\nleft\n")),
+    patch("bob@x", 1, v("seed@x" -> 1), "right", textEdit("notes.txt", "base\n", "base\nright\n")),
+    validSeed
   )
 
   def spec = suite("Codec")(
-    suite("valid repositories")(
-      test("empty repository passes") {
-        assertTrue(Codec.validateRepository(repo(Version.empty)) == Right(()))
+    suite("validateRepository — valid repositories")(
+      test("empty repository is valid") {
+        assertTrue(Codec.validateRepository(repo(v())) == Right(()))
       },
-      test("single text-create patch passes") {
-        assertTrue(Codec.validateRepository(validSingle) == Right(()))
+      test("single create patch is valid") {
+        assertTrue(Codec.validateRepository(repo(v("seed@x" -> 1), validSeed)) == Right(()))
       },
-      test("multi-revision single-author chain passes") {
-        assertTrue(Codec.validateRepository(validChain) == Right(()))
+      test("multi-author concurrent history is valid") {
+        assertTrue(Codec.validateRepository(validMultiAuthor) == Right(()))
       },
-      test("test 05 golden stored edit script passes") {
-        assertTrue(Codec.validateRepository(validRepeatedLines) == Right(()))
-      },
-      test("concurrent two-author history passes") {
-        val r = repo(
-          v("a@x" -> 1, "b@x" -> 1),
-          patch("a@x", 1, Version.empty, "a", createText("a.txt", "a\n")),
-          patch("b@x", 1, Version.empty, "b", createText("b.txt", "b\n"))
-        )
-        assertTrue(Codec.validateRepository(r) == Right(()))
-      },
-      test("empty text edit creates an empty file and passes") {
-        val r = repo(v("a@x" -> 1), patch("a@x", 1, Version.empty, "empty", createText("f", "")))
-        assertTrue(Codec.validateRepository(r) == Right(()))
-      }
-    ),
-    suite("frontier canonical form")(
-      test("unsorted frontier fails with a canonical-frontier message (test 23)") {
-        val r = Repository(v("b@x" -> 1, "a@x" -> 1), Vector.empty)
-        val detail = leftDetail(Codec.validateRepository(r))
+      test("structurally identical duplicate dots collapse and stay valid") {
         assertTrue(
-          detail.matches(".*canonical.*"),
-          detail.contains("frontier is not canonical")
+          Codec.validateRepository(repo(v("seed@x" -> 1), validSeed, validSeed)) == Right(())
         )
       },
-      test("frontier component without a patch fails as missing") {
-        val r = Repository(v("a@x" -> 1), Vector.empty)
-        val detail = leftDetail(Codec.validateRepository(r))
-        assertTrue(detail.contains("missing a@x revision 1"))
+      test("binary put followed by a different put replacement is valid") {
+        val p1 = patch("a@x", 1, v(), "one", putBytes("f", Array[Byte](0, 1)))
+        val p2 = patch("a@x", 2, v("a@x" -> 1), "two", putBytes("f", Array[Byte](0, 2)))
+        assertTrue(Codec.validateRepository(repo(v("a@x" -> 2), p1, p2)) == Right(()))
       },
-      test("frontier not matching the joined results fails as non-canonical") {
-        // All patches are reachable from the declared (b@x->1) frontier, but the joined patch
-        // results also include a@x->1, so the declared frontier is incomplete.
-        val r = Repository(
-          v("b@x" -> 1),
-          Vector(
-            patch("a@x", 1, Version.empty, "a", createText("a.txt", "a\n")),
-            patch("b@x", 1, v("a@x" -> 1), "b", createText("b.txt", "b\n"))
-          )
-        )
-        val detail = leftDetail(Codec.validateRepository(r))
-        assertTrue(detail.matches(".*canonical.*"))
+      test("empty text edit creating an empty file is valid") {
+        val p = patch("a@x", 1, v(), "empty", Change.Text("f", Vector.empty))
+        assertTrue(Codec.validateRepository(repo(v("a@x" -> 1), p)) == Right(()))
       }
     ),
-    suite("patch and change ordering")(
-      test("unsorted patches fail (test 27)") {
-        val r = repo(
-          v("a@x" -> 1, "b@x" -> 1),
-          patch("b@x", 1, Version.empty, "b", createText("b.txt", "b\n")),
-          patch("a@x", 1, Version.empty, "a", createText("a.txt", "a\n"))
-        )
-        assertTrue(Codec.validateRepository(r).isLeft)
+    suite("validateRepository — frontier and ordering")(
+      test("unsorted frontier is rejected as non-canonical (test 23)") {
+        val frontier = Version(Vector((id("b@x"), 1L), (id("a@x"), 1L)))
+        val r = Codec.validateRepository(Repository(frontier, Vector.empty))
+        assertError(r) {
+          case e: SnapError.NonCanonicalFrontier => e.detail.contains("canonical")
+          case _                                 => false
+        }
       },
-      test("revisions out of order for one author fail (test 27)") {
-        val r = repo(
-          v("a@x" -> 2),
-          patch("a@x", 2, v("a@x" -> 1), "second", createText("g", "g\n")),
-          patch("a@x", 1, Version.empty, "first", createText("f", "f\n"))
-        )
-        assertTrue(Codec.validateRepository(r).isLeft)
+      test("duplicate contributor in the frontier is rejected") {
+        val frontier = Version(Vector((id("a@x"), 1L), (id("a@x"), 2L)))
+        val r = Codec.validateRepository(Repository(frontier, Vector.empty))
+        assertError(r)(_.isInstanceOf[SnapError.NonCanonicalFrontier])
       },
-      test("unsorted changes fail (test 27)") {
+      test("unsorted patches are rejected (test 27)") {
+        val pb = patch("b@x", 1, v(), "b", textCreate("b", "b\n"))
+        val pa = patch("a@x", 1, v(), "a", textCreate("a", "a\n"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1, "b@x" -> 1), pb, pa))
+        assertError(r)(_.detail.contains("not sorted"))
+      },
+      test("unsorted changes within a patch are rejected (test 27)") {
+        val p = patch("a@x", 1, v(), "order", putText("z", "z\n"), putText("a", "a\n"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertError(r)(_.detail.contains("not sorted by path"))
+      },
+      test("duplicate change path within a patch is rejected") {
+        val p = patch("a@x", 1, v(), "dup", putText("f", "x"), putText("f", "y"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertTrue(r == Left(SnapError.TreePathsConflict("f")))
+      }
+    ),
+    suite("validateRepository — dots and history")(
+      test("revision != base[author] + 1 is rejected (test 27)") {
+        val p = patch("a@x", 1, v("a@x" -> 1), "wrong dot", textCreate("f", "f\n"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertTrue(r == Left(SnapError.CyclicOrIncompleteHistory))
+      },
+      test("different values at one dot are a collision (test 16)") {
+        val p1 = patch("a@x", 1, v(), "local", textCreate("file.txt", "local\n"))
+        val p2 = patch("a@x", 1, v(), "different", textCreate("file.txt", "remote\n"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p1, p2))
+        assertTrue(r == Left(SnapError.PatchCollision("a@x", 1))) &&
+        assertTrue(r.swap.toOption.get.detail == "patch collision: a@x revision 1")
+      },
+      test("revision gap reports the missing patch (test 15)") {
+        val p = patch("a@x", 2, v("a@x" -> 1), "gap", textCreate("f", "f\n"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 2), p))
+        assertTrue(r == Left(SnapError.MissingPatch("a@x", 1))) &&
+        assertTrue(r.swap.toOption.get.detail.contains("missing a@x"))
+      },
+      test("base dot without a patch is reported missing") {
+        val p = patch("a@x", 1, v("ghost@x" -> 1), "ghost", textCreate("f", "f\n"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertTrue(r == Left(SnapError.MissingPatch("ghost@x", 1)))
+      },
+      test("patch with an empty frontier is unreachable (test 23)") {
+        val p = patch("a@x", 1, v(), "unreachable", textCreate("f", "f\n"))
+        val r = Codec.validateRepository(repo(v(), p))
+        assertTrue(r == Left(SnapError.UnreachablePatch("a@x", 1))) &&
+        assertTrue(r.swap.toOption.get.detail.startsWith("unreachable patch:"))
+      },
+      test("patch dot beyond the frontier is unreachable") {
+        val p1 = patch("a@x", 1, v(), "one", textCreate("f", "one\n"))
+        val p2 = patch("a@x", 2, v("a@x" -> 1), "two", textEdit("f", "one\n", "one\ntwo\n"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p1, p2))
+        assertTrue(r == Left(SnapError.UnreachablePatch("a@x", 2)))
+      },
+      test("dependency cycle is rejected (test 15)") {
+        val pa = patch("a@x", 1, v("b@x" -> 1), "cycle a", textCreate("a", "a\n"))
+        val pb = patch("b@x", 1, v("a@x" -> 1), "cycle b", textCreate("b", "b\n"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1, "b@x" -> 1), pa, pb))
+        assertTrue(r == Left(SnapError.CyclicOrIncompleteHistory))
+      }
+    ),
+    suite("validateRepository — patch structure")(
+      test("empty message is rejected (test 23)") {
+        val p = patch("a@x", 1, v(), "", textCreate("f", "f\n"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertError(r) {
+          case SnapError.EmptyField(_, field) => field == "message"
+          case _                              => false
+        }
+      },
+      test("empty changes are rejected (test 23)") {
+        val p = Patch(id("a@x"), 1, v(), "none", Vector.empty)
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertError(r) {
+          case SnapError.EmptyField(_, field) => field == "changes"
+          case _                              => false
+        }
+      },
+      test("message with a forbidden control character is rejected") {
+        val p = patch("a@x", 1, v(), "bad\u0001msg", textCreate("f", "f\n"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertError(r)(_.isInstanceOf[SnapError.InvalidMessage])
+      },
+      test("adjacent same-kind edit ops are rejected (test 15)") {
         val p = patch(
           "a@x",
           1,
-          Version.empty,
-          "order",
-          createText("z", "z\n"),
-          createText("a", "a\n")
-        )
-        assertTrue(Codec.validateRepository(repo(v("a@x" -> 1), p)).isLeft)
-      },
-      test("two changes for one path fail as a tree paths conflict") {
-        val p = patch(
-          "a@x",
-          1,
-          Version.empty,
-          "dup",
-          Change.Put("f", Array[Byte](1)),
-          Change.Put("f", Array[Byte](2))
-        )
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1), p)))
-        assertTrue(detail.contains("tree paths conflict: f"))
-      }
-    ),
-    suite("dot consistency")(
-      test("revision != base[author] + 1 fails (test 27)") {
-        val p = patch("a@x", 1, v("a@x" -> 1), "wrong dot", createText("f", ""))
-        assertTrue(Codec.validateRepository(repo(v("a@x" -> 1), p)).isLeft)
-      },
-      test("revision jumping over the next base revision fails (test 27)") {
-        val p = patch("a@x", 3, v("a@x" -> 1), "jump", createText("f", ""))
-        assertTrue(Codec.validateRepository(repo(v("a@x" -> 3), p)).isLeft)
-      }
-    ),
-    suite("one value per dot")(
-      test("same dot with different values fails as patch collision (test 16)") {
-        val p1 = patch("a@x", 1, Version.empty, "local", createText("f", "local\n"))
-        val p2 = patch("a@x", 1, Version.empty, "different", createText("f", "remote\n"))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1), p1, p2)))
-        assertTrue(detail.contains("patch collision: a@x revision 1"))
-      },
-      test("structurally equal duplicate dots collapse and pass (test 26)") {
-        val p1 = patch("a@x", 1, Version.empty, "one", createText("f", "one\n"))
-        val p2 = patch("a@x", 1, Version.empty, "one", createText("f", "one\n"))
-        assertTrue(Codec.validateRepository(repo(v("a@x" -> 1), p1, p2)) == Right(()))
-      }
-    ),
-    suite("contiguity and closure")(
-      test("revision gap fails as missing patch (test 15)") {
-        val p = patch("a@x", 2, v("a@x" -> 1), "gap", createText("f", ""))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 2), p)))
-        assertTrue(detail.contains("missing a@x revision 1"))
-      },
-      test("base referencing an absent dot fails as missing patch") {
-        val p = patch("a@x", 1, v("z@x" -> 1), "dangling", createText("f", ""))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1), p)))
-        assertTrue(detail.contains("missing z@x revision 1"))
-      },
-      test("patch outside the frontier closure fails as unreachable (test 23)") {
-        val p = patch("a@x", 1, Version.empty, "unreachable", createText("f", ""))
-        val detail = leftDetail(Codec.validateRepository(repo(Version.empty, p)))
-        assertTrue(detail.matches("unreachable patch: .+"))
-      }
-    ),
-    suite("acyclic causality")(
-      test("two-patch dependency cycle fails (test 15)") {
-        val pa = patch("a@x", 1, v("b@x" -> 1), "cycle a", createText("a", ""))
-        val pb = patch("b@x", 1, v("a@x" -> 1), "cycle b", createText("b", ""))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1, "b@x" -> 1), pa, pb)))
-        assertTrue(detail.contains("cyclic or incomplete patch history"))
-      }
-    ),
-    suite("message and changes")(
-      test("empty message fails (test 23)") {
-        val p = patch("a@x", 1, Version.empty, "", createText("f", ""))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1), p)))
-        assertTrue(detail.endsWith("message is empty"))
-      },
-      test("empty changes fail (test 23)") {
-        val p = Patch(id("a@x"), 1, Version.empty, "none", Vector.empty)
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1), p)))
-        assertTrue(detail.endsWith("changes is empty"))
-      }
-    ),
-    suite("edit script shape")(
-      test("adjacent same-kind ops fail (test 15)") {
-        val p = patch(
-          "a@x",
-          1,
-          Version.empty,
+          v(),
           "adjacent",
           Change.Text("f", Vector(Insert(Vector("a\n")), Insert(Vector("b\n"))))
         )
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1), p)))
-        assertTrue(detail.contains("adjacent insert"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertTrue(r == Left(SnapError.AdjacentSameKindOps("insert"))) &&
+        assertTrue(r.swap.toOption.get.detail.contains("adjacent insert"))
       },
-      test("non-canonical insert tokens fail (test 27)") {
-        val p = patch(
-          "a@x",
-          1,
-          Version.empty,
-          "bad token",
-          Change.Text("f", Vector(Insert(Vector("a", "b"))))
-        )
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1), p)))
-        assertTrue(detail.contains("canonical token sequence"))
+      test("zero retain count is rejected (test 23)") {
+        val p = patch("a@x", 1, v(), "bad count", Change.Text("f", Vector(Retain(0))))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertError(r) {
+          case e: SnapError.NotPositiveSafeInteger => e.detail.endsWith("positive safe integer")
+          case _                                   => false
+        }
       },
-      test("insert token with interior LF fails") {
-        val p = patch(
-          "a@x",
-          1,
-          Version.empty,
-          "interior lf",
-          Change.Text("f", Vector(Insert(Vector("a\nb\n"))))
-        )
-        assertTrue(Codec.validateRepository(repo(v("a@x" -> 1), p)).isLeft)
+      test("negative delete count is rejected") {
+        val p1 = patch("a@x", 1, v(), "one", textCreate("f", "f\n"))
+        val p2 = patch("a@x", 2, v("a@x" -> 1), "neg", Change.Text("f", Vector(Delete(-1))))
+        val r = Codec.validateRepository(repo(v("a@x" -> 2), p1, p2))
+        assertError(r)(_.isInstanceOf[SnapError.NotPositiveSafeInteger])
+      },
+      test("empty insert array is rejected (test 23)") {
+        val p = patch("a@x", 1, v(), "empty insert", Change.Text("f", Vector(Insert(Vector.empty))))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertError(r) {
+          case SnapError.EmptyField(_, field) => field == "insert"
+          case _                              => false
+        }
+      },
+      test("non-canonical insert token sequence is rejected (test 27)") {
+        val p =
+          patch("a@x", 1, v(), "bad token", Change.Text("f", Vector(Insert(Vector("a", "b")))))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertError(r)(_.isInstanceOf[SnapError.NonCanonicalTokens])
+      },
+      test("insert token with an interior line break is rejected") {
+        val p =
+          patch("a@x", 1, v(), "bad token", Change.Text("f", Vector(Insert(Vector("a\nb\n")))))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertError(r)(_.isInstanceOf[SnapError.NonCanonicalTokens])
+      },
+      test("insert token containing NUL is rejected at change-vs-base") {
+        val p = patch("a@x", 1, v(), "nul", Change.Text("f", Vector(Insert(Vector("a\u0000")))))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertError(r)(_.isInstanceOf[SnapError.NonCanonicalTokens])
+      },
+      test("path under .snap is rejected (test 15)") {
+        val p = patch("a@x", 1, v(), "bad path", putText(".snap/secret", "a"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertError(r) {
+          case e: SnapError.InvalidRepoPath => e.detail.startsWith("path is invalid")
+          case _                            => false
+        }
+      },
+      test("path with a dot-dot segment is rejected") {
+        val p = patch("a@x", 1, v(), "bad path", putText("a/../b", "a"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertError(r)(_.isInstanceOf[SnapError.InvalidRepoPath])
+      },
+      test("prefix-conflicting change paths are rejected (test 15)") {
+        val p = patch("a@x", 1, v(), "prefix", putText("a", "a"), putText("a/b", "b"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1), p))
+        assertTrue(r == Left(SnapError.TreePathsConflict("a/b"))) &&
+        assertTrue(r.swap.toOption.get.detail.contains("tree paths conflict"))
       }
     ),
-    suite("path validity and prefix-free trees")(
-      test("path under .snap fails (test 15)") {
-        val p = patch("a@x", 1, Version.empty, "bad path", Change.Put(".snap/secret", Array(97)))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1), p)))
-        assertTrue(detail.contains("path is invalid"))
+    suite("validateRepository — changes against base")(
+      test("delete of an absent path is rejected (test 23)") {
+        val pa = patch("a@x", 1, v(), "base", putText("f", "a"))
+        val pb = patch("b@x", 1, v(), "absent", del("f"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 1, "b@x" -> 1), pa, pb))
+        assertTrue(r == Left(SnapError.DeleteOfAbsentPath("f"))) &&
+        assertTrue(r.swap.toOption.get.detail == "delete of absent path: f")
       },
-      test("path with backslash fails") {
-        val p = patch("a@x", 1, Version.empty, "backslash", createText("a\\b", ""))
-        assertTrue(Codec.validateRepository(repo(v("a@x" -> 1), p)).isLeft)
-      },
-      test("prefix conflict within one patch fails (test 15)") {
-        val p = patch(
-          "a@x",
-          1,
-          Version.empty,
-          "prefix",
-          Change.Put("a", Array(97)),
-          Change.Put("a/b", Array(98))
-        )
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1), p)))
-        assertTrue(detail.contains("tree paths conflict"))
-      }
-    ),
-    suite("change versus materialized base")(
-      test("delete of absent path fails with the exact message (test 23)") {
-        val pa = patch("a@x", 1, Version.empty, "base", createText("f", "one\n"))
-        val pb = patch("b@x", 1, Version.empty, "absent", Change.Del("f"))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1, "b@x" -> 1), pa, pb)))
-        assertTrue(detail.contains("delete of absent path: f"))
-      },
-      test("no-op put with identical bytes fails (test 15)") {
-        val bytes = Array[Byte](97)
-        val p1 = patch("a@x", 1, Version.empty, "base", Change.Put("f", bytes))
-        val p2 = patch("a@x", 2, v("a@x" -> 1), "no op", Change.Put("f", bytes.clone()))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 2), p1, p2)))
-        assertTrue(detail.contains("no-op change"))
-      },
-      test("no-op text edit producing identical bytes fails") {
-        val p1 = patch("a@x", 1, Version.empty, "base", createText("f", "one\n"))
-        val p2 = patch("a@x", 2, v("a@x" -> 1), "noop", Change.Text("f", Vector(Retain(1))))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 2), p1, p2)))
-        assertTrue(detail.contains("no-op change"))
-      },
-      test("text create of a present path fails (test 27)") {
-        val p1 = patch("a@x", 1, Version.empty, "base", Change.Put("f", Array(97)))
+      test("empty text edit over a present path is rejected as create-of-present (test 27)") {
+        val p1 = patch("a@x", 1, v(), "one", putText("f", "a"))
         val p2 = patch("a@x", 2, v("a@x" -> 1), "create present", Change.Text("f", Vector.empty))
-        assertTrue(Codec.validateRepository(repo(v("a@x" -> 2), p1, p2)).isLeft)
+        val r = Codec.validateRepository(repo(v("a@x" -> 2), p1, p2))
+        assertError(r)(_.isInstanceOf[SnapError.CreateOfPresentPath])
       },
-      test("text change over a binary base fails (test 27)") {
-        val p1 = patch("a@x", 1, Version.empty, "binary", Change.Put("f", Array(0)))
+      test("text change over a binary base is rejected (test 27)") {
+        val p1 = patch("a@x", 1, v(), "binary", putBytes("f", Array[Byte](0)))
         val p2 =
           patch("a@x", 2, v("a@x" -> 1), "text over binary", Change.Text("f", Vector(Delete(1))))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 2), p1, p2)))
-        assertTrue(detail.contains("text change over binary base"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 2), p1, p2))
+        assertError(r)(_.isInstanceOf[SnapError.TextOverBinaryBase])
       },
-      test("edit under-consuming old tokens fails (test 15)") {
-        val p1 = patch("a@x", 1, Version.empty, "base", createText("f", "one\ntwo\n"))
+      test("edit that under-consumes the old tokens is rejected (test 15)") {
+        val p1 = patch("a@x", 1, v(), "base", textCreate("f", "one\ntwo\n"))
         val p2 = patch("a@x", 2, v("a@x" -> 1), "underconsume", Change.Text("f", Vector(Retain(1))))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 2), p1, p2)))
-        assertTrue(detail.contains("does not consume old content"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 2), p1, p2))
+        assertError(r) {
+          case e: SnapError.EditNotConsuming => e.detail.contains("does not consume old content")
+          case _                             => false
+        }
       },
-      test("edit consuming beyond old content fails (test 23)") {
-        val pa = patch("a@x", 1, Version.empty, "base", createText("f", "one\n"))
-        val pb = patch("b@x", 1, Version.empty, "overconsume", Change.Text("f", Vector(Delete(2))))
-        val detail = leftDetail(Codec.validateRepository(repo(v("a@x" -> 1, "b@x" -> 1), pa, pb)))
-        assertTrue(detail.contains("consumes beyond old content"))
+      test("edit that consumes beyond the old content is rejected (test 23)") {
+        val p1 = patch("a@x", 1, v(), "base", textCreate("f", "one\n"))
+        val p2 = patch("a@x", 2, v("a@x" -> 1), "overconsume", Change.Text("f", Vector(Delete(2))))
+        val r = Codec.validateRepository(repo(v("a@x" -> 2), p1, p2))
+        assertError(r) {
+          case e: SnapError.EditOverconsumes => e.detail.contains("consumes beyond old content")
+          case _                             => false
+        }
+      },
+      test("put with identical bytes is rejected as no-op (test 15)") {
+        val p1 = patch("a@x", 1, v(), "one", putText("f", "a"))
+        val p2 = patch("a@x", 2, v("a@x" -> 1), "no op", putText("f", "a"))
+        val r = Codec.validateRepository(repo(v("a@x" -> 2), p1, p2))
+        assertTrue(r == Left(SnapError.NoOpChange("f"))) &&
+        assertTrue(r.swap.toOption.get.detail.contains("no-op change"))
+      },
+      test("text edit producing identical bytes is rejected as no-op") {
+        val p1 = patch("a@x", 1, v(), "one", textCreate("f", "x\n"))
+        val p2 = patch("a@x", 2, v("a@x" -> 1), "no op", Change.Text("f", Vector(Retain(1))))
+        val r = Codec.validateRepository(repo(v("a@x" -> 2), p1, p2))
+        assertError(r)(_.isInstanceOf[SnapError.NoOpChange])
       }
     ),
-    suite("cross-repository collision (test 16)")(
-      test("different values at one dot collide with the exact message") {
-        val local = Vector(patch("a@x", 1, Version.empty, "local", createText("f", "local\n")))
-        val remote = Vector(patch("a@x", 1, Version.empty, "different", createText("f", "r\n")))
-        val detail = leftDetail(Codec.checkCollision(local, remote))
-        assertTrue(detail.contains("patch collision: a@x revision 1"))
+    suite("checkCollision")(
+      test("same dot with different values fails with the pinned message (test 16)") {
+        val local = Vector(patch("a@x", 1, v(), "local", textCreate("file.txt", "local\n")))
+        val remote = Vector(patch("a@x", 1, v(), "different", textCreate("file.txt", "remote\n")))
+        val r = Codec.checkCollision(local, remote)
+        assertTrue(r == Left(SnapError.PatchCollision("a@x", 1))) &&
+        assertTrue(r.swap.toOption.get.detail == "patch collision: a@x revision 1")
       },
-      test("structurally equal dots do not collide (test 26)") {
-        val local = Vector(patch("a@x", 1, Version.empty, "one", createText("f", "one\n")))
-        val remote = Vector(patch("a@x", 1, Version.empty, "one", createText("f", "one\n")))
+      test("structurally equal dots are duplicates, not collisions (test 26)") {
+        val local = Vector(patch("a@x", 1, v(), "same", textCreate("f", "same\n")))
+        val remote = Vector(patch("a@x", 1, v(), "same", textCreate("f", "same\n")))
         assertTrue(Codec.checkCollision(local, remote) == Right(()))
       },
-      test("disjoint dots do not collide") {
-        val local = Vector(patch("a@x", 1, Version.empty, "one", createText("f", "one\n")))
-        val remote = Vector(patch("b@x", 1, Version.empty, "two", createText("g", "two\n")))
+      test("disjoint dot sets never collide") {
+        val local = Vector(patch("a@x", 1, v(), "a", textCreate("a", "a\n")))
+        val remote = Vector(patch("b@x", 1, v(), "b", textCreate("b", "b\n")))
         assertTrue(Codec.checkCollision(local, remote) == Right(()))
       }
     ),
     suite("joinedFrontier")(
-      test("joins the local frontier with every incoming result (test 21)") {
-        val b1 = patch("b@x", 1, v("a@x" -> 1), "b1", createText("g", "b1\n"))
-        val b2 = patch("b@x", 2, v("a@x" -> 1, "b@x" -> 1), "b2", createText("g", "b2\n"))
+      test("componentwise join over incoming patch results (test 21)") {
+        val a1 = patch("a@x", 1, v(), "a1", textCreate("story.txt", "base\n"))
+        val a2 = patch("a@x", 2, v("a@x" -> 1), "a2", textEdit("story.txt", "base\n", "base\nA2\n"))
+        val b1 = patch("b@x", 1, v("a@x" -> 1), "b1", textEdit("story.txt", "base\n", "base\nB1\n"))
+        val b2 = patch(
+          "b@x",
+          2,
+          v("a@x" -> 1, "b@x" -> 1),
+          "b2",
+          textEdit("story.txt", "base\nB1\n", "base\nB1\nB2\n")
+        )
         val joined = Codec.joinedFrontier(v("a@x" -> 2), Vector(b1, b2))
-        assertTrue(joined.render == "(a@x->2,b@x->2)")
+        assertTrue(joined.render == "(a@x->2,b@x->2)") &&
+        assertTrue(
+          Codec
+            .joinedFrontier(v("a@x" -> 1, "b@x" -> 2), Vector(a1, a2))
+            .render == "(a@x->2,b@x->2)"
+        )
+      }
+    ),
+    suite("knownVersion")(
+      test("version within a closed frontier is known") {
+        val p1 = patch("a@x", 1, v(), "one", textCreate("f", "one\n"))
+        val p2 = patch("a@x", 2, v("a@x" -> 1), "two", textEdit("f", "one\n", "one\ntwo\n"))
+        val r = repo(v("a@x" -> 2), p1, p2)
+        assertTrue(Codec.knownVersion(r, v("a@x" -> 1)) == Right(()))
       },
-      test("empty incoming leaves the local frontier unchanged") {
-        assertTrue(Codec.joinedFrontier(v("a@x" -> 1), Vector.empty).render == "(a@x->1)")
+      test("version beyond the frontier is unknown") {
+        val p1 = patch("a@x", 1, v(), "one", textCreate("f", "one\n"))
+        val r = repo(v("a@x" -> 1), p1)
+        assertError(Codec.knownVersion(r, v("a@x" -> 9)))(_.isInstanceOf[SnapError.UnknownVersion])
+      },
+      test("version whose selection is not base-closed is unknown") {
+        val p1 = patch("a@x", 1, v(), "one", textCreate("f", "one\n"))
+        val p2 = patch("b@x", 1, v("a@x" -> 1), "two", textEdit("f", "one\n", "one\ntwo\n"))
+        val r = repo(v("a@x" -> 1, "b@x" -> 1), p1, p2)
+        assertTrue(Codec.knownVersion(r, v("b@x" -> 1)) == Left(SnapError.MissingPatch("a@x", 1)))
       }
     )
   )

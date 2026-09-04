@@ -25,35 +25,49 @@ object Replay {
     * or a missing dependency.
     */
   def integrationOrder(patches: Vector[Patch]): Either[SnapError, Vector[Patch]] =
-    dedupePatches(patches) match {
-      case Left(err) => Left(err)
-      case Right(deduped) =>
-        val integrated = mutable.HashSet.empty[(String, Long)]
-        val remaining = mutable.ArrayBuffer.from(deduped)
-        val out = Vector.newBuilder[Patch]
-        var failure: Option[SnapError] = None
-        while (remaining.nonEmpty && failure.isEmpty) {
-          var best = -1
-          var i = 0
-          while (i < remaining.length) {
-            val p = remaining(i)
-            val ready = p.base.components.forall(c => integrated.contains((c._1.value, c._2)))
-            if (ready && (best < 0 || patchOrdering.compare(remaining(best), p) > 0)) best = i
-            i += 1
-          }
-          if (best < 0) failure = Some(SnapError.CyclicOrIncompleteHistory)
-          else {
-            val chosen = remaining(best)
-            out += chosen
-            integrated += ((chosen.author.value, chosen.revision))
-            remaining.remove(best)
-          }
-        }
-        failure match {
-          case Some(err) => Left(err)
-          case None      => Right(out.result())
-        }
+    dedupePatches(patches).flatMap { deduped =>
+      val dots = deduped.map(p => (p.author.value, p.revision)).toSet
+      deduped.iterator
+        .flatMap(_.base.components)
+        .collectFirst {
+          case (cid, rev) if !dots.contains((cid.value, rev)) =>
+            SnapError.MissingPatch(cid.value, rev)
+        } match {
+        case Some(err) => Left(err)
+        case None      => topoSort(deduped)
+      }
     }
+
+  /** Ready-set walk over an already-deduplicated, base-closed patch set. Stalled readiness means a
+    * dependency cycle.
+    */
+  private def topoSort(deduped: Vector[Patch]): Either[SnapError, Vector[Patch]] = {
+    val integrated = mutable.HashSet.empty[(String, Long)]
+    val remaining = mutable.ArrayBuffer.from(deduped)
+    val out = Vector.newBuilder[Patch]
+    var failure: Option[SnapError] = None
+    while (remaining.nonEmpty && failure.isEmpty) {
+      var best = -1
+      var i = 0
+      while (i < remaining.length) {
+        val p = remaining(i)
+        val ready = p.base.components.forall(c => integrated.contains((c._1.value, c._2)))
+        if (ready && (best < 0 || patchOrdering.compare(remaining(best), p) > 0)) best = i
+        i += 1
+      }
+      if (best < 0) failure = Some(SnapError.CyclicOrIncompleteHistory)
+      else {
+        val chosen = remaining(best)
+        out += chosen
+        integrated += ((chosen.author.value, chosen.revision))
+        remaining.remove(best)
+      }
+    }
+    failure match {
+      case Some(err) => Left(err)
+      case None      => Right(out.result())
+    }
+  }
 
   /** Collapse structurally equal duplicate dots; different values at one dot are corruption (SPEC
     * §4.2, §3.5). Preserves first-occurrence order.

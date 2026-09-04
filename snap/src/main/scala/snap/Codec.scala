@@ -4,337 +4,379 @@ import snap.Model.*
 
 import scala.collection.mutable
 
-/** Semantic repository validation (SPEC §4.5) over values already decoded by [[Json]], plus the
-  * cross-repository helpers used by `merge` and `diff --repo`.
+/** Semantic repository validation (SPEC §4.5) over decoded [[Model.Repository]] values.
   *
-  * Structural JSON checks (duplicate keys, unknown fields, integer-literal strictness, base64
-  * canonicality, edit-op arity, empty insert/changes, path and message validity) belong to the JSON
-  * layer. Codec validates the decoded typed value: history shape, ordering, closure, and every
-  * change against its materialized exact base. Validation is pure and never mutates anything, so a
-  * failed validation cannot touch working files (SPEC §10).
+  * The JSON layer ([[Json.parseRepository]]) already rejects structural schema problems: unknown
+  * fields, duplicate keys, non-integer numbers, malformed base64, invalid contributor IDs, invalid
+  * paths, empty messages/changes/inserts, wrong edit-op arity, and non-positive counts. `Codec`
+  * validates everything that needs the typed model and the history as a whole, in the fixed
+  * first-error-wins order of SPEC §4.5:
+  *
+  *   1. canonical frontier sort; 2. patches sorted by (author unsigned-UTF-8, revision); 3. changes
+  *      sorted by path, at most one per path; 4. `revision == base[author] + 1` for every patch; 5.
+  *      one value per dot (structurally equal duplicates collapse, different values are a
+  *      [[SnapError.PatchCollision]]); 6. contiguous contributor revisions (1..max) for every
+  *      author of a patch or frontier dot; 7. complete base closure: every base dot exists as a
+  *      patch; 8. every patch is reachable from the declared frontier (no unreachable patch, no
+  *      patch dot beyond the frontier); 9. acyclic causality ([[Replay.integrationOrder]]); 10.
+  *      message and changes non-empty; 11. edit-script shape: no adjacent same-kind operations,
+  *      positive counts, non-empty inserts; 12. insert-token canonicality; 13. tracked-path
+  *      validity; 14. prefix-free change paths within one patch; 15. every change validated against
+  *      its materialized exact base tree ([[validateChangesAgainstBase]]); 16. deterministic replay
+  *      of the declared frontier succeeds.
+  *
+  * Validation never mutates anything: all functions are pure.
   */
 object Codec {
 
-  /** SPEC §4.5 full validation in pinned order; the first failure wins. */
-  def validateRepository(repo: Repository): Either[SnapError, Unit] = {
-    val patches = repo.patches
+  /** Full SPEC §4.5 validation. Called on every repository load; the first error wins. */
+  def validateRepository(repo: Repository): Either[SnapError, Unit] =
     for {
-      _ <- checkFrontierCanonical(repo.frontier)
-      _ <- checkPatchesSorted(patches)
-      _ <- checkChangesSortedAndUnique(patches)
-      _ <- checkDotConsistency(patches)
-      deduped <- Replay.dedupePatches(patches)
-      _ <- checkContiguity(deduped)
-      _ <- checkBaseClosure(deduped)
-      _ <- checkReachability(deduped, repo.frontier)
-      _ <- Replay.integrationOrder(deduped).map(_ => ())
-      _ <- checkStaticChangeDetails(deduped)
+      _ <- checkFrontierSorted(repo.frontier)
+      _ <- checkPatchesSorted(repo.patches)
+      _ <- firstError(repo.patches.map(checkChangesSortedAndUnique))
+      _ <- firstError(repo.patches.map(checkDotConsistency))
+      _ <- checkDotCollisions(repo.patches)
+      _ <- checkContiguity(repo)
+      _ <- checkBaseClosure(repo.patches)
+      _ <- checkReachability(repo)
+      _ <- Replay.integrationOrder(repo.patches).map(_ => ())
+      _ <- firstError(repo.patches.map(checkPatchStructure))
+      // Steps 15+16 in one canonical replay: each patch's changes are validated against its
+      // materialized exact base tree, and the declared frontier must materialize.
       _ <- Replay
-        .materializeValidating(deduped, repo.frontier, validateChangesAgainstBase)
+        .materializeValidating(repo.patches, repo.frontier, validateChangesAgainstBase)
         .map(_ => ())
     } yield ()
-  }
 
-  /** Validate one patch's changes against its materialized exact base tree (SPEC §4.3, §4.4, §4.5
-    * step 5). Used both as the replay validation hook and directly by commit.
+  /** §4.3/§4.4: validate one patch's changes against its exact materialized base tree.
+    *
+    *   - delete requires the path present in the base;
+    *   - a no-op change (identical bytes) is invalid;
+    *   - an empty text edit is a create and requires the path absent from the base;
+    *   - a text edit requires a text base and must consume the old tokens exactly while producing a
+    *     canonical token sequence.
     */
-  def validateChangesAgainstBase(patch: Patch, baseTree: Model.Tree): Either[SnapError, Unit] = {
-    var resultTree = baseTree
-    val it = patch.changes.iterator
-    var failure: Option[SnapError] = None
-    while (it.hasNext && failure.isEmpty) {
-      val change = it.next()
-      change match {
-        case Change.Del(path) =>
-          if (!baseTree.contains(path)) failure = Some(SnapError.DeleteOfAbsentPath(path))
-          else resultTree = resultTree - path
+  def validateChangesAgainstBase(patch: Patch, baseTree: Model.Tree): Either[SnapError, Unit] =
+    firstError(patch.changes.map(ch => validateChangeAgainstBase(ch, baseTree)))
 
-        case Change.Put(path, bytes) =>
-          baseTree.get(path) match {
-            case Some(old) if Model.bytesEqual(old, bytes) =>
-              failure = Some(SnapError.NoOpChange(path))
-            case _ =>
-              resultTree = resultTree.updated(path, bytes)
-          }
-
-        case Change.Text(path, edit) =>
-          baseTree.get(path) match {
-            case Some(old) if !Model.isText(old) =>
-              failure = Some(SnapError.TextOverBinaryBase(path))
-            case Some(_) if edit.isEmpty =>
-              // An empty edit only creates an empty file; over an existing path it is a
-              // create-of-present-path error (SPEC §4.3/§4.4).
-              failure = Some(SnapError.CreateOfPresentPath(path))
-            case Some(old) =>
-              val baseTokens = Model.tokenize(Model.decodeUtf8(old).get)
-              Model.applyEdit(baseTokens, edit, path) match {
-                case Left(err) => failure = Some(err)
-                case Right(tokens) =>
-                  val bytes = Model.utf8Bytes(Model.detokenize(tokens))
-                  if (Model.bytesEqual(bytes, old)) failure = Some(SnapError.NoOpChange(path))
-                  else resultTree = resultTree.updated(path, bytes)
-              }
-            case None =>
-              Model.applyEdit(Vector.empty, edit, path) match {
-                case Left(err) => failure = Some(err)
-                case Right(tokens) =>
-                  resultTree = resultTree.updated(path, Model.utf8Bytes(Model.detokenize(tokens)))
-              }
-          }
-      }
-    }
-    failure match {
-      case Some(err) => Left(err)
-      case None      => checkPrefixFree(resultTree)
-    }
-  }
-
-  /** Cross-repository dot-collision check (SPEC §3.5; tests 16, 26). Must run before any local
-    * mutation. Structurally equal duplicates are fine; different values at one dot are corruption.
+  /** §3.5: cross-repository dot collisions. Same dot with structurally different values is
+    * corruption and must fail before any local mutation (tests 16, 26). Structurally equal
+    * duplicates are allowed and collapse during merge.
     */
   def checkCollision(local: Vector[Patch], remote: Vector[Patch]): Either[SnapError, Unit] = {
-    val localByDot = local.groupBy(p => (p.author.value, p.revision))
-    val it = remote.iterator
-    while (it.hasNext) {
-      val rp = it.next()
-      localByDot.get((rp.author.value, rp.revision)) match {
-        case Some(lps) if lps.exists(lp => !Patch.sameValue(lp, rp)) =>
-          return Left(SnapError.PatchCollision(rp.author.value, rp.revision))
-        case _ => ()
-      }
+    val localByDot = local.map(p => (p.author.value, p.revision) -> p).toMap
+    remote.collectFirst {
+      case rp
+          if localByDot
+            .get((rp.author.value, rp.revision))
+            .exists(lp => !Patch.sameValue(lp, rp)) =>
+        SnapError.PatchCollision(rp.author.value, rp.revision)
+    } match {
+      case Some(err) => Left(err)
+      case None      => Right(())
     }
-    Right(())
   }
 
-  /** New frontier after importing `incoming` patches: componentwise join of the local frontier with
-    * every imported patch result (SPEC §3.3).
+  /** The frontier after importing `incoming` patches: the componentwise join of the local frontier
+    * with every incoming patch's result version.
     */
   def joinedFrontier(localFrontier: Version, incoming: Vector[Patch]): Version =
     incoming.foldLeft(localFrontier)((acc, p) => Version.join(acc, p.result))
 
-  // ---------------------------------------------------------------------------
-  // §4.5 step-by-step checks
-  // ---------------------------------------------------------------------------
-
-  /** Step 1: frontier components must be in canonical unsigned-UTF-8 author order. */
-  private def checkFrontierCanonical(frontier: Version): Either[SnapError, Unit] = {
-    val comps = frontier.components
-    val sorted = comps.sortWith((a, b) => Model.utf8Compare(a._1.value, b._1.value) < 0)
-    val unique = comps.map(_._1.value).distinct.length == comps.length
-    if (unique && comps == sorted) Right(())
-    else
-      Left(
-        SnapError.NonCanonicalFrontier(
-          renderPairs(comps),
-          renderPairs(sorted)
-        )
-      )
-  }
-
-  private def renderPairs(pairs: Vector[(ContributorId, Long)]): String =
-    if (pairs.isEmpty) "()"
-    else pairs.map { case (id, r) => s"${id.value}->$r" }.mkString("(", ",", ")")
-
-  /** Step 2: patches sorted by author (unsigned UTF-8), then numeric revision. */
-  private def checkPatchesSorted(patches: Vector[Patch]): Either[SnapError, Unit] = {
-    var i = 1
-    while (i < patches.length) {
-      val prev = patches(i - 1)
-      val cur = patches(i)
-      val c = Model.utf8Compare(prev.author.value, cur.author.value)
-      val ok =
-        if (c < 0) true
-        else if (c == 0) prev.revision <= cur.revision
-        else false
-      if (!ok)
-        return Left(
-          SnapError.InvalidVersion(
-            s"patches are not canonically sorted at ${cur.author.value} revision ${cur.revision}"
-          )
-        )
-      i += 1
-    }
-    Right(())
-  }
-
-  /** Step 3: within each patch, changes sorted by path with at most one change per path. */
-  private def checkChangesSortedAndUnique(patches: Vector[Patch]): Either[SnapError, Unit] = {
-    val it = patches.iterator
-    while (it.hasNext) {
-      val p = it.next()
-      var i = 1
-      while (i < p.changes.length) {
-        val prevPath = p.changes(i - 1).path
-        val curPath = p.changes(i).path
-        val c = Model.utf8Compare(prevPath, curPath)
-        if (c == 0) return Left(SnapError.TreePathsConflict(curPath))
-        if (c > 0)
-          return Left(
-            SnapError.InvalidVersion(
-              s"changes in patch ${p.author.value} revision ${p.revision} are not sorted by path"
-            )
-          )
-        i += 1
-      }
-    }
-    Right(())
-  }
-
-  /** Step 4: every patch satisfies revision = base[author] + 1 (SPEC §4.2). */
-  private def checkDotConsistency(patches: Vector[Patch]): Either[SnapError, Unit] = {
-    val it = patches.iterator
-    while (it.hasNext) {
-      val p = it.next()
-      val expected = p.base.get(p.author) + 1
-      if (p.revision != expected)
-        return Left(
-          SnapError.InvalidVersion(
-            s"patch ${p.author.value} revision ${p.revision} does not satisfy revision = base[author] + 1"
-          )
-        )
-    }
-    Right(())
-  }
-
-  /** Step 6: for each author, revisions are contiguous starting at 1 (SPEC §3.5). Assumes the input
-    * is deduplicated and sorted by (author, revision).
+  /** §4.1: `version` is known (materializable) when it lies within the frontier and its selected
+    * patch set is base-closed. Commands (`diff`, `revert`) reject unknown versions.
     */
-  private def checkContiguity(patches: Vector[Patch]): Either[SnapError, Unit] = {
-    var currentAuthor: Option[String] = None
-    var expectedRev = 1L
-    val it = patches.iterator
-    while (it.hasNext) {
-      val p = it.next()
-      val author = p.author.value
-      if (currentAuthor.contains(author)) {
-        if (p.revision != expectedRev)
-          return Left(SnapError.MissingPatch(author, expectedRev))
-        expectedRev += 1
-      } else {
-        if (p.revision != 1L) return Left(SnapError.MissingPatch(author, 1L))
-        currentAuthor = Some(author)
-        expectedRev = 2L
+  def knownVersion(repo: Repository, version: Version): Either[SnapError, Unit] =
+    if (!Version.knownIn(version, repo.frontier)) Left(SnapError.UnknownVersion(version.render))
+    else {
+      val selected = repo.patches.filter(p => version.get(p.author) >= p.revision)
+      val dots = selected.map(p => (p.author.value, p.revision)).toSet
+      selected.iterator
+        .flatMap(_.base.components)
+        .collectFirst {
+          case (cid, rev) if !dots.contains((cid.value, rev)) =>
+            SnapError.MissingPatch(cid.value, rev)
+        } match {
+        case Some(err) => Left(err)
+        case None      => Right(())
       }
     }
-    Right(())
+
+  // ---------------------------------------------------------------------------
+  // §4.5 steps 1–9: shape, ordering, dots, closure, acyclicity
+  // ---------------------------------------------------------------------------
+
+  /** Step 1: frontier components sorted by unsigned-UTF-8 author with unique IDs. */
+  private def checkFrontierSorted(frontier: Version): Either[SnapError, Unit] = {
+    val cs = frontier.components
+    val sorted = cs.sortWith((a, b) => Model.utf8Compare(a._1.value, b._1.value) < 0)
+    val unique = sorted.distinctBy(_._1.value)
+    if (cs == unique) Right(())
+    else
+      Left(SnapError.NonCanonicalFrontier(Version(cs).render, Version(unique).render))
   }
 
-  /** Step 7: every dot referenced in a base exists among the patches. */
+  /** Step 2: patches sorted by (author unsigned-UTF-8, numeric revision). Structurally equal
+    * adjacent duplicates are allowed (collapsed later); reverse order is a format violation.
+    */
+  private def checkPatchesSorted(patches: Vector[Patch]): Either[SnapError, Unit] = {
+    val unsorted = patches.sliding(2).exists {
+      case Vector(p1, p2) =>
+        val c = Model.utf8Compare(p1.author.value, p2.author.value)
+        c > 0 || (c == 0 && p1.revision > p2.revision)
+      case _ => false
+    }
+    if (unsorted)
+      Left(SnapError.InvalidJson("repository: patches are not sorted by author and revision"))
+    else Right(())
+  }
+
+  /** Step 3: changes within one patch sorted by path, at most one change per path. */
+  private def checkChangesSortedAndUnique(p: Patch): Either[SnapError, Unit] = {
+    val paths = p.changes.map(_.path)
+    paths.indices.drop(1).find(i => Model.utf8Compare(paths(i - 1), paths(i)) >= 0) match {
+      case Some(i) if paths(i - 1) == paths(i) =>
+        Left(SnapError.TreePathsConflict(paths(i)))
+      case Some(_) =>
+        Left(
+          SnapError.InvalidJson(
+            s"repository: changes in patch ${p.author.value} revision ${p.revision} are not sorted by path"
+          )
+        )
+      case None => Right(())
+    }
+  }
+
+  /** Step 4: SPEC §4.2 — `revision = base[author] + 1`. A base already containing the patch's own
+    * dot (or beyond) is a self-referencing, i.e. cyclic or inconsistent, history.
+    */
+  private def checkDotConsistency(p: Patch): Either[SnapError, Unit] =
+    if (p.revision == p.base.get(p.author) + 1L) Right(())
+    else Left(SnapError.CyclicOrIncompleteHistory)
+
+  /** Step 5: one value per dot; structurally equal duplicates are fine, anything else is
+    * corruption.
+    */
+  private def checkDotCollisions(patches: Vector[Patch]): Either[SnapError, Unit] = {
+    val seen = mutable.HashMap.empty[(String, Long), Patch]
+    var failure: Option[SnapError] = None
+    val it = patches.iterator
+    while (it.hasNext && failure.isEmpty) {
+      val p = it.next()
+      val key = (p.author.value, p.revision)
+      seen.get(key) match {
+        case Some(prev) if !Patch.sameValue(prev, p) =>
+          failure = Some(SnapError.PatchCollision(p.author.value, p.revision))
+        case Some(_) => ()
+        case None    => seen.update(key, p)
+      }
+    }
+    failure match {
+      case Some(err) => Left(err)
+      case None      => Right(())
+    }
+  }
+
+  /** Step 6: for every author appearing in patches or the frontier, revisions 1..max are all
+    * present. The first missing revision is reported.
+    */
+  private def checkContiguity(repo: Repository): Either[SnapError, Unit] = {
+    val maxRev = mutable.HashMap.empty[String, Long]
+    def bump(id: String, rev: Long): Unit =
+      if (rev > maxRev.getOrElse(id, 0L)) maxRev.update(id, rev)
+    repo.patches.foreach(p => bump(p.author.value, p.revision))
+    repo.frontier.components.foreach { case (cid, rev) => bump(cid.value, rev) }
+
+    val present: Map[String, Set[Long]] =
+      repo.patches.groupBy(_.author.value).view.mapValues(_.map(_.revision).toSet).toMap
+
+    val authors = maxRev.keys.toVector.sortWith((a, b) => Model.utf8Compare(a, b) < 0)
+    var failure: Option[SnapError] = None
+    val it = authors.iterator
+    while (it.hasNext && failure.isEmpty) {
+      val author = it.next()
+      val revs = present.getOrElse(author, Set.empty[Long])
+      var k = 1L
+      while (k <= maxRev(author) && failure.isEmpty) {
+        if (!revs.contains(k)) failure = Some(SnapError.MissingPatch(author, k))
+        k += 1
+      }
+    }
+    failure match {
+      case Some(err) => Left(err)
+      case None      => Right(())
+    }
+  }
+
+  /** Step 7: every dot referenced in every base exists as a patch. */
   private def checkBaseClosure(patches: Vector[Patch]): Either[SnapError, Unit] = {
     val dots = patches.map(p => (p.author.value, p.revision)).toSet
-    val it = patches.iterator
-    while (it.hasNext) {
-      val p = it.next()
-      val bIt = p.base.components.iterator
-      while (bIt.hasNext) {
-        val (id, rev) = bIt.next()
-        if (!dots.contains((id.value, rev)))
-          return Left(SnapError.MissingPatch(id.value, rev))
-      }
+    patches.iterator
+      .flatMap(_.base.components)
+      .collectFirst {
+        case (id, rev) if !dots.contains((id.value, rev)) => SnapError.MissingPatch(id.value, rev)
+      } match {
+      case Some(err) => Left(err)
+      case None      => Right(())
     }
-    Right(())
   }
 
-  /** Step 8: every patch lies in the causal closure of the frontier, and the frontier is exactly
-    * the componentwise maximum over all patch results.
+  /** Step 8: every patch lies in the causal closure of the frontier — no patch dot beyond the
+    * frontier, and walking bases back from the frontier dots reaches every patch.
     */
-  private def checkReachability(
-      patches: Vector[Patch],
-      frontier: Version
-  ): Either[SnapError, Unit] = {
-    val byDot = patches.map(p => ((p.author.value, p.revision), p)).toMap
-    val visited = mutable.HashSet.empty[(String, Long)]
-    val queue = mutable.Queue.empty[(String, Long)]
-    val fIt = frontier.components.iterator
-    while (fIt.hasNext) {
-      val (id, rev) = fIt.next()
-      val dot = (id.value, rev)
-      if (!byDot.contains(dot)) return Left(SnapError.MissingPatch(id.value, rev))
-      queue.enqueue(dot)
-    }
-    while (queue.nonEmpty) {
-      val dot = queue.dequeue()
-      if (!visited.contains(dot)) {
-        visited += dot
-        byDot(dot).base.components.foreach(c => queue.enqueue((c._1.value, c._2)))
-      }
-    }
-    patches.find(p => !visited.contains((p.author.value, p.revision))) match {
-      case Some(p) => Left(SnapError.UnreachablePatch(p.author.value, p.revision))
+  private def checkReachability(repo: Repository): Either[SnapError, Unit] = {
+    repo.patches.collectFirst {
+      case p if p.revision > repo.frontier.get(p.author) =>
+        SnapError.UnreachablePatch(p.author.value, p.revision)
+    } match {
+      case Some(err) => Left(err)
       case None =>
-        val expectedFrontier =
-          patches.foldLeft(Version.empty)((acc, p) => Version.join(acc, p.result))
-        if (expectedFrontier == frontier) Right(())
-        else
-          Left(
-            SnapError.NonCanonicalFrontier(frontier.render, expectedFrontier.render)
-          )
+        val byDot = repo.patches.map(p => (p.author.value, p.revision) -> p).toMap
+        val visited = mutable.HashSet.empty[(String, Long)]
+        val queue = mutable.Queue.empty[(String, Long)]
+        repo.frontier.components.foreach { case (cid, rev) =>
+          val key = (cid.value, rev)
+          if (byDot.contains(key) && visited.add(key)) queue.enqueue(key)
+        }
+        while (queue.nonEmpty) {
+          val key = queue.dequeue()
+          byDot.get(key).foreach { p =>
+            p.base.components.foreach { case (cid, rev) =>
+              val k = (cid.value, rev)
+              if (byDot.contains(k) && visited.add(k)) queue.enqueue(k)
+            }
+          }
+        }
+        repo.patches.collectFirst {
+          case p if !visited.contains((p.author.value, p.revision)) =>
+            SnapError.UnreachablePatch(p.author.value, p.revision)
+        } match {
+          case Some(err) => Left(err)
+          case None      => Right(())
+        }
     }
   }
 
-  /** Steps 10–14: per-change static checks that are defense-in-depth over the JSON layer and the
-    * prefix-free guarantee of a patch's authored result (SPEC §2, §4.2, §4.4).
+  // ---------------------------------------------------------------------------
+  // §4.5 steps 10–14: per-patch structural checks
+  // ---------------------------------------------------------------------------
+
+  private def checkPatchStructure(p: Patch): Either[SnapError, Unit] =
+    for {
+      _ <- Model.validateStoredMessage(p.message)
+      _ <- if (p.changes.isEmpty) Left(SnapError.EmptyField("patch", "changes")) else Right(())
+      _ <- firstError(p.changes.map(checkChangeStructure))
+      _ <- checkPrefixConflicts(p.changes)
+    } yield ()
+
+  private def checkChangeStructure(ch: Change): Either[SnapError, Unit] =
+    ch match {
+      case Change.Text(path, edit) =>
+        checkEditOps(path, edit).flatMap(_ => Model.validatePath(path))
+      case other => Model.validatePath(other.path)
+    }
+
+  /** Steps 11–12: edit-script shape beyond what the JSON layer enforces — no adjacent same-kind
+    * operations, positive counts, non-empty inserts, and canonical insert-token sequences.
     */
-  private def checkStaticChangeDetails(patches: Vector[Patch]): Either[SnapError, Unit] = {
-    val it = patches.iterator
-    while (it.hasNext) {
-      val p = it.next()
-      if (p.message.isEmpty) return Left(SnapError.EmptyField("patch", "message"))
-      if (p.changes.isEmpty) return Left(SnapError.EmptyField("patch", "changes"))
-      val cIt = p.changes.iterator
-      while (cIt.hasNext) {
-        val change = cIt.next()
-        Model.validatePath(change.path) match {
-          case Left(err) => return Left(err)
-          case Right(()) => ()
+  private def checkEditOps(path: String, edit: Vector[EditOp]): Either[SnapError, Unit] =
+    adjacentKind(edit) match {
+      case Some(kind) => Left(SnapError.AdjacentSameKindOps(kind))
+      case None =>
+        edit.collectFirst {
+          case EditOp.Retain(n) if n < 1L =>
+            SnapError.NotPositiveSafeInteger("retain count")
+          case EditOp.Delete(n) if n < 1L =>
+            SnapError.NotPositiveSafeInteger("delete count")
+          case EditOp.Insert(tokens) if tokens.isEmpty =>
+            SnapError.EmptyField("edit", "insert")
+          case EditOp.Insert(tokens)
+              if !tokens.forall(Model.isValidInsertToken) ||
+                !Model.isCanonicalTokenSeq(tokens) =>
+            SnapError.NonCanonicalTokens(path)
+        } match {
+          case Some(err) => Left(err)
+          case None      => Right(())
         }
-        change match {
-          case Change.Text(path, edit) =>
-            adjacentSameKind(edit) match {
-              case Some(kind) => return Left(SnapError.AdjacentSameKindOps(kind))
-              case None       => ()
-            }
-            val badToken = edit.iterator.collectFirst {
-              case EditOp.Insert(tokens) if tokens.exists(t => !Model.isValidInsertToken(t)) =>
-                true
-            }
-            if (badToken.isDefined) return Left(SnapError.NonCanonicalTokens(path))
-          case _ => ()
-        }
-      }
-      // A patch's authored change paths must themselves be prefix-free (SPEC §2).
-      val paths = p.changes.map(_.path)
-      val conflict = paths.sliding(2).collectFirst {
-        case Vector(a, b) if Model.isProperAncestor(a, b) => b
-      }
-      conflict match {
-        case Some(path) => return Left(SnapError.TreePathsConflict(path))
-        case None       => ()
-      }
     }
-    Right(())
-  }
 
-  private def adjacentSameKind(edit: Vector[EditOp]): Option[String] = {
+  private def adjacentKind(edit: Vector[EditOp]): Option[String] = {
     def kind(op: EditOp): String = op match {
       case _: EditOp.Retain => "retain"
       case _: EditOp.Delete => "delete"
       case _: EditOp.Insert => "insert"
     }
-    edit.sliding(2).collectFirst {
-      case Vector(a, b) if kind(a) == kind(b) => kind(a)
+    edit.sliding(2).collectFirst { case Vector(a, b) if kind(a) == kind(b) => kind(a) }
+  }
+
+  /** Step 14: change paths within one patch form a prefix-free set. */
+  private def checkPrefixConflicts(changes: Vector[Change]): Either[SnapError, Unit] = {
+    val paths = changes.map(_.path)
+    var failure: Option[SnapError] = None
+    var i = 0
+    while (i < paths.length && failure.isEmpty) {
+      var j = i + 1
+      while (j < paths.length && failure.isEmpty) {
+        if (
+          Model.isProperAncestor(paths(i), paths(j)) ||
+          Model.isProperAncestor(paths(j), paths(i))
+        ) failure = Some(SnapError.TreePathsConflict(paths(j)))
+        j += 1
+      }
+      i += 1
+    }
+    failure match {
+      case Some(err) => Left(err)
+      case None      => Right(())
     }
   }
 
-  /** The authored result tree must be prefix-free by path segment (SPEC §2). */
-  private def checkPrefixFree(tree: Model.Tree): Either[SnapError, Unit] = {
-    val paths = Model.sortedPaths(tree)
-    val conflict = paths.sliding(2).collectFirst {
-      case Vector(a, b) if Model.isProperAncestor(a, b) => b
-    }
-    conflict match {
-      case Some(path) => Left(SnapError.TreePathsConflict(path))
-      case None       => Right(())
+  // ---------------------------------------------------------------------------
+  // §4.5 step 15: change-vs-base validation
+  // ---------------------------------------------------------------------------
+
+  private def validateChangeAgainstBase(
+      ch: Change,
+      baseTree: Model.Tree
+  ): Either[SnapError, Unit] = {
+    val path = ch.path
+    val base = baseTree.get(path)
+    ch match {
+      case Change.Del(_) =>
+        if (base.isEmpty) Left(SnapError.DeleteOfAbsentPath(path)) else Right(())
+
+      case Change.Put(_, bytes) =>
+        base match {
+          case Some(existing) if Model.bytesEqual(existing, bytes) =>
+            Left(SnapError.NoOpChange(path))
+          case _ => Right(())
+        }
+
+      case Change.Text(_, edit) =>
+        base match {
+          case Some(_) if edit.isEmpty =>
+            // An empty text edit is the create form (§4.4) and requires an absent path.
+            Left(SnapError.CreateOfPresentPath(path))
+          case Some(existing) if !Model.isText(existing) =>
+            Left(SnapError.TextOverBinaryBase(path))
+          case _ =>
+            val baseTokens =
+              base.flatMap(b => Model.decodeUtf8(b).map(Model.tokenize)).getOrElse(Vector.empty)
+            Model.applyEdit(baseTokens, edit, path).flatMap { resultTokens =>
+              val resultBytes = Model.utf8Bytes(Model.detokenize(resultTokens))
+              if (!Model.isText(resultBytes)) Left(SnapError.NonCanonicalTokens(path))
+              else if (base.exists(b => Model.bytesEqual(b, resultBytes)))
+                Left(SnapError.NoOpChange(path))
+              else Right(())
+            }
+        }
     }
   }
+
+  private def firstError(checks: Vector[Either[SnapError, Unit]]): Either[SnapError, Unit] =
+    checks.collectFirst { case Left(err) => err } match {
+      case Some(err) => Left(err)
+      case None      => Right(())
+    }
 }

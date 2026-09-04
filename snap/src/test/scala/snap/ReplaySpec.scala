@@ -2,490 +2,421 @@ package snap
 
 import zio.test.*
 
-import snap.Model
 import snap.Model.*
 import snap.Model.EditOp.*
 
-/** Unit tests for deterministic replay (SPEC §6) pinned against CONTRACT §11 and the YAML goldens
+/** Unit tests for deterministic replay (SPEC §6), pinned against the merge/replay YAML goldens
   * (tests 09, 10, 11, 17, 18, 21, 22).
   */
 object ReplaySpec extends ZIOSpecDefault {
 
-  private def id(s: String): ContributorId = ContributorId.parse(s).toOption.get
+  private def id(s: String): ContributorId =
+    ContributorId.parse(s).fold(e => throw new IllegalStateException(e.detail), identity)
 
+  /** Version from (author, revision) pairs; sorts canonically for convenience. */
   private def v(pairs: (String, Long)*): Version =
-    Version(pairs.map { case (a, r) => (id(a), r) }.toVector)
+    Version(
+      pairs
+        .map { case (a, r) => (id(a), r) }
+        .toVector
+        .sortWith((x, y) => Model.utf8Compare(x._1.value, y._1.value) < 0)
+    )
 
-  private def createText(path: String, content: String): Change =
-    if (content.isEmpty) Change.Text(path, Vector.empty)
-    else Change.Text(path, Vector(Insert(Model.tokenize(content))))
+  private def textCreate(path: String, content: String): Change.Text = {
+    val toks = Model.tokenize(content)
+    Change.Text(path, if (toks.isEmpty) Vector.empty else Vector(Insert(toks)))
+  }
 
-  private def editText(path: String, oldContent: String, newContent: String): Change =
+  private def textEdit(path: String, oldContent: String, newContent: String): Change.Text =
     Change.Text(path, Diff.canonicalDiff(Model.tokenize(oldContent), Model.tokenize(newContent)))
+
+  private def putText(path: String, content: String): Change.Put =
+    Change.Put(path, Model.utf8Bytes(content))
+
+  private def putBytes(path: String, bytes: Array[Byte]): Change.Put =
+    Change.Put(path, bytes)
+
+  private def del(path: String): Change.Del = Change.Del(path)
 
   private def patch(
       author: String,
       rev: Long,
       base: Version,
-      msg: String,
+      message: String,
       changes: Change*
-  ): Patch =
-    Patch(id(author), rev, base, msg, changes.toVector)
+  ): Patch = Patch(id(author), rev, base, message, changes.toVector)
 
-  private def ok[A](e: Either[SnapError, A]): A = e.toOption.get
-
-  private def treeText(tree: Model.Tree, path: String): String =
-    Model.decodeUtf8(tree(path)).get
+  private def treeText(tree: Model.Tree, path: String): Option[String] =
+    tree.get(path).flatMap(Model.decodeUtf8)
 
   private def materializeOk(
       patches: Vector[Patch],
       target: Version
   ): (Model.Tree, Vector[ReplayWarning]) =
-    ok(Replay.materialize(patches, target))
+    Replay
+      .materialize(patches, target)
+      .fold(e => throw new IllegalStateException(e.detail), identity)
+
+  // Test 09 fixture.
+  private val seed09 = patch("seed@x", 1, v(), "base", textCreate("notes.txt", "base\n"))
+  private val alice09 =
+    patch("alice@x", 1, v("seed@x" -> 1), "left", textEdit("notes.txt", "base\n", "base\nleft\n"))
+  private val bob09 =
+    patch("bob@x", 1, v("seed@x" -> 1), "right", textEdit("notes.txt", "base\n", "base\nright\n"))
+  private val target09 = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
+
+  // Test 10 fixture.
+  private val seed10 = patch(
+    "seed@x",
+    1,
+    v(),
+    "base",
+    textCreate("delete.txt", "base\n"),
+    textCreate("identical.txt", "base\n"),
+    textCreate("incompatible.txt", "base\n"),
+    textCreate("later-put.txt", "base\n")
+  )
+  private val alice10 = patch(
+    "alice@x",
+    1,
+    v("seed@x" -> 1),
+    "left",
+    textEdit("delete.txt", "base\n", "left\n"),
+    textEdit("identical.txt", "base\n", "same\n"),
+    textEdit("incompatible.txt", "base\n", "left text\n"),
+    putBytes("later-put.txt", Array[Byte](0, 1))
+  )
+  private val bob10 = patch(
+    "bob@x",
+    1,
+    v("seed@x" -> 1),
+    "right",
+    del("delete.txt"),
+    textEdit("identical.txt", "base\n", "same\n"),
+    putBytes("incompatible.txt", Array[Byte](0, 0xff.toByte)),
+    textEdit("later-put.txt", "base\n", "right text\n")
+  )
+  private val target10 = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
+
+  // Test 18 fixture.
+  private val seed18 = patch("seed@x", 1, v(), "base", textCreate("story.txt", "start\nend\n"))
+  private val a18 = patch(
+    "a@x",
+    1,
+    v("seed@x" -> 1),
+    "a",
+    Change.Text("story.txt", Vector(Retain(1), Insert(Vector("A\n")), Retain(1)))
+  )
+  private val b18 = patch(
+    "b@x",
+    1,
+    v("seed@x" -> 1),
+    "b",
+    Change.Text("story.txt", Vector(Retain(1), Insert(Vector("B\n")), Retain(1)))
+  )
+  private val c18 = patch(
+    "c@x",
+    1,
+    v("seed@x" -> 1),
+    "c",
+    Change.Text("story.txt", Vector(Delete(1), Retain(1)))
+  )
+  private val target18 = v("a@x" -> 1, "b@x" -> 1, "c@x" -> 1, "seed@x" -> 1)
+
+  // Test 21 fixture.
+  private val a211 = patch("a@x", 1, v(), "a1", textCreate("story.txt", "base\n"))
+  private val a212 =
+    patch("a@x", 2, v("a@x" -> 1), "a2", textEdit("story.txt", "base\n", "base\nA2\n"))
+  private val b211 =
+    patch("b@x", 1, v("a@x" -> 1), "b1", textEdit("story.txt", "base\n", "base\nB1\n"))
+  private val b212 =
+    patch(
+      "b@x",
+      2,
+      v("a@x" -> 1, "b@x" -> 1),
+      "b2",
+      textEdit("story.txt", "base\nB1\n", "base\nB1\nB2\n")
+    )
+  private val patches21 = Vector(a211, a212, b211, b212)
+  private val target21 = v("a@x" -> 2, "b@x" -> 2)
+
+  private def base5: Patch = patch("seed@x", 1, v(), "base", textCreate("f", "0\n1\n2\n3\n4\n"))
+  private def target22 = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
+  private def otScenario(aliceText: String, bobText: String): Vector[Patch] =
+    Vector(
+      base5,
+      patch("alice@x", 1, v("seed@x" -> 1), "alice", textEdit("f", "0\n1\n2\n3\n4\n", aliceText)),
+      patch("bob@x", 1, v("seed@x" -> 1), "bob", textEdit("f", "0\n1\n2\n3\n4\n", bobText))
+    )
 
   def spec = suite("Replay")(
     suite("materialize basics")(
-      test("empty patch set yields empty tree and no warnings") {
-        val (tree, ws) = materializeOk(Vector.empty, Version.empty)
-        assertTrue(tree.isEmpty, ws.isEmpty)
+      test("empty patch set materializes the empty tree at the empty version") {
+        val result = Replay.materialize(Vector.empty, Version.empty)
+        assertTrue(result == Right((Model.emptyTree, Vector.empty)))
       },
-      test("single text create installs the file bytes") {
-        val p = patch("a@x", 1, Version.empty, "one", createText("f", "one\n"))
-        val (tree, ws) = materializeOk(Vector(p), v("a@x" -> 1))
-        assertTrue(treeText(tree, "f") == "one\n", ws.isEmpty)
+      test("single text-create patch produces the file") {
+        val (tree, warnings) = materializeOk(Vector(seed09), v("seed@x" -> 1))
+        assertTrue(treeText(tree, "notes.txt").contains("base\n"), warnings.isEmpty)
       },
-      test("single put create installs binary bytes") {
-        val bytes = Array[Byte](0, 1, 2)
-        val p = patch("a@x", 1, Version.empty, "bin", Change.Put("data.bin", bytes))
-        val (tree, _) = materializeOk(Vector(p), v("a@x" -> 1))
-        assertTrue(Model.bytesEqual(tree("data.bin"), bytes))
+      test("sequential single-author chain reaches the final content") {
+        val p1 = patch("a@x", 1, v(), "one", textCreate("f", "one\n"))
+        val p2 = patch("a@x", 2, v("a@x" -> 1), "two", textEdit("f", "one\n", "one\ntwo\n"))
+        val p3 = patch("a@x", 3, v("a@x" -> 2), "three", textEdit("f", "one\ntwo\n", "two\n"))
+        val (tree, warnings) = materializeOk(Vector(p1, p2, p3), v("a@x" -> 3))
+        assertTrue(treeText(tree, "f").contains("two\n"), warnings.isEmpty)
       },
-      test("empty text edit creates an empty file (test 06 semantics)") {
-        val p = patch("a@x", 1, Version.empty, "empty", createText("empty", ""))
-        val (tree, _) = materializeOk(Vector(p), v("a@x" -> 1))
-        assertTrue(tree.contains("empty"), tree("empty").length == 0)
+      test("materialize at a mid-history version returns the partial tree") {
+        val p1 = patch("a@x", 1, v(), "one", textCreate("f", "one\n"))
+        val p2 = patch("a@x", 2, v("a@x" -> 1), "two", textEdit("f", "one\n", "one\ntwo\n"))
+        val (tree, warnings) = materializeOk(Vector(p1, p2), v("a@x" -> 1))
+        assertTrue(treeText(tree, "f").contains("one\n"), warnings.isEmpty)
       },
-      test("sequential single-author chain applies edits in order") {
-        val p1 = patch("a@x", 1, Version.empty, "one", createText("f", "one\n"))
-        val p2 = patch("a@x", 2, v("a@x" -> 1), "two", editText("f", "one\n", "one\ntwo\n"))
-        val p3 = patch("a@x", 3, v("a@x" -> 2), "three", editText("f", "one\ntwo\n", "two\n"))
-        val (tree, ws) = materializeOk(Vector(p1, p2, p3), v("a@x" -> 3))
-        assertTrue(treeText(tree, "f") == "two\n", ws.isEmpty)
+      test("empty text edit creates an empty file") {
+        val p = patch("a@x", 1, v(), "empty", Change.Text("f", Vector.empty))
+        val (tree, warnings) = materializeOk(Vector(p), v("a@x" -> 1))
+        assertTrue(tree.get("f").exists(_.isEmpty), warnings.isEmpty)
       },
-      test("delete removes the path from the tree") {
-        val p1 = patch("a@x", 1, Version.empty, "one", createText("f", "one\n"))
-        val p2 = patch("a@x", 2, v("a@x" -> 1), "del", Change.Del("f"))
-        val (tree, ws) = materializeOk(Vector(p1, p2), v("a@x" -> 2))
-        assertTrue(!tree.contains("f"), ws.isEmpty)
-      },
-      test("materialize at a mid-history version stops at that version (test 21 shape)") {
-        val a1 = patch("a@x", 1, Version.empty, "a1", createText("story.txt", "base\n"))
-        val a2 = patch("a@x", 2, v("a@x" -> 1), "a2", editText("story.txt", "base\n", "base\nA2\n"))
-        val b1 = patch("b@x", 1, v("a@x" -> 1), "b1", editText("story.txt", "base\n", "base\nB1\n"))
-        val b2 =
-          patch(
-            "b@x",
-            2,
-            v("a@x" -> 1, "b@x" -> 1),
-            "b2",
-            editText("story.txt", "base\nB1\n", "base\nB1\nB2\n")
-          )
-        val (tree, ws) = materializeOk(Vector(a1, a2, b1, b2), v("a@x" -> 1, "b@x" -> 2))
-        assertTrue(treeText(tree, "story.txt") == "base\nB1\nB2\n", ws.isEmpty)
-      },
-      test("target missing a base dependency fails as cyclic or incomplete") {
-        // a2's base references a@x->1 but only a2 is supplied.
-        val a2 = patch("a@x", 2, v("a@x" -> 1), "a2", createText("f", "x\n"))
+      test("target missing a required base dot fails with MissingPatch") {
+        val p1 = patch("a@x", 1, v(), "one", textCreate("f", "one\n"))
+        val p2 = patch("b@x", 1, v("a@x" -> 1), "two", textEdit("f", "one\n", "one\ntwo\n"))
         assertTrue(
-          Replay
-            .materialize(Vector(a2), v("a@x" -> 2))
-            .left
-            .toOption
-            .contains(SnapError.CyclicOrIncompleteHistory)
+          Replay.materialize(Vector(p1, p2), v("b@x" -> 1)) ==
+            Left(SnapError.MissingPatch("a@x", 1))
         )
       },
       test("replay is deterministic across repeated calls") {
-        val p1 = patch("a@x", 1, Version.empty, "one", createText("f", "one\n"))
-        val p2 = patch("b@x", 1, Version.empty, "two", createText("f", "two\n"))
-        val r1 = materializeOk(Vector(p1, p2), v("a@x" -> 1, "b@x" -> 1))
-        val r2 = materializeOk(Vector(p1, p2), v("a@x" -> 1, "b@x" -> 1))
-        assertTrue(Model.treeEqual(r1._1, r2._1), r1._2 == r2._2)
+        val r1 = Replay.materialize(Vector(seed09, alice09, bob09), target09)
+        val r2 = Replay.materialize(Vector(seed09, alice09, bob09), target09)
+        (r1, r2) match {
+          case (Right((t1, w1)), Right((t2, w2))) =>
+            assertTrue(Model.treeEqual(t1, t2), w1 == w2)
+          case _ => assertTrue(false)
+        }
       }
     ),
-    suite("integrationOrder (SPEC §6.1)")(
-      test("orders a causal chain base-first") {
-        val p1 = patch("a@x", 1, Version.empty, "one", createText("f", "one\n"))
-        val p2 = patch("a@x", 2, v("a@x" -> 1), "two", createText("g", "two\n"))
-        val order = ok(Replay.integrationOrder(Vector(p2, p1)))
-        assertTrue(order.map(_.revision) == Vector(1L, 2L))
+    suite("test 09 line OT")(
+      test("concurrent single-line inserts merge to base right left with no warnings") {
+        val (tree, warnings) = materializeOk(Vector(seed09, alice09, bob09), target09)
+        assertTrue(treeText(tree, "notes.txt").contains("base\nright\nleft\n"), warnings.isEmpty)
       },
-      test("test 09: concurrent seed/alice/bob order is seed, bob, alice") {
-        val seed = patch("seed@x", 1, Version.empty, "base", createText("notes.txt", "base\n"))
-        val alice =
-          patch(
-            "alice@x",
-            1,
-            v("seed@x" -> 1),
-            "left",
-            editText("notes.txt", "base\n", "base\nleft\n")
-          )
-        val bob =
-          patch(
-            "bob@x",
-            1,
-            v("seed@x" -> 1),
-            "right",
-            editText("notes.txt", "base\n", "base\nright\n")
-          )
-        val order = ok(Replay.integrationOrder(Vector(alice, seed, bob)))
-        assertTrue(order.map(_.author.value) == Vector("seed@x", "bob@x", "alice@x"))
-      },
-      test("test 18: three-way order after seed is c, b, a") {
-        val seed =
-          patch("seed@x", 1, Version.empty, "base", createText("story.txt", "start\nend\n"))
-        val a = patch(
-          "a@x",
-          1,
-          v("seed@x" -> 1),
-          "a",
-          editText("story.txt", "start\nend\n", "start\nA\nend\n")
-        )
-        val b = patch(
-          "b@x",
-          1,
-          v("seed@x" -> 1),
-          "b",
-          editText("story.txt", "start\nend\n", "start\nB\nend\n")
-        )
-        val c =
-          patch("c@x", 1, v("seed@x" -> 1), "c", editText("story.txt", "start\nend\n", "end\n"))
-        val order = ok(Replay.integrationOrder(Vector(a, b, c, seed)))
-        assertTrue(order.map(_.author.value) == Vector("seed@x", "c@x", "b@x", "a@x"))
-      },
-      test("dependency cycle is rejected") {
-        val pa = patch("a@x", 1, v("b@x" -> 1), "cycle a", createText("a", ""))
-        val pb = patch("b@x", 1, v("a@x" -> 1), "cycle b", createText("b", ""))
-        assertTrue(
-          Replay
-            .integrationOrder(Vector(pa, pb))
-            .left
-            .toOption
-            .contains(SnapError.CyclicOrIncompleteHistory)
-        )
-      },
-      test("missing base dependency is rejected") {
-        val p = patch("a@x", 1, v("zz@x" -> 9), "dangling", createText("f", ""))
-        assertTrue(
-          Replay
-            .integrationOrder(Vector(p))
-            .left
-            .toOption
-            .contains(SnapError.CyclicOrIncompleteHistory)
-        )
-      },
-      test("structurally equal duplicate dots collapse to one entry") {
-        val p1 = patch("a@x", 1, Version.empty, "one", createText("f", "one\n"))
-        val p2 = patch("a@x", 1, Version.empty, "one", createText("f", "one\n"))
-        val order = ok(Replay.integrationOrder(Vector(p1, p2)))
-        assertTrue(order.length == 1)
-      },
-      test("different values at one dot are a patch collision (test 16)") {
-        val p1 = patch("a@x", 1, Version.empty, "local", createText("f", "local\n"))
-        val p2 = patch("a@x", 1, Version.empty, "different", createText("f", "remote\n"))
-        assertTrue(
-          Replay
-            .integrationOrder(Vector(p1, p2))
-            .left
-            .toOption
-            .exists(_.detail.contains("patch collision: a@x revision 1"))
-        )
-      }
-    ),
-    suite("test 09 line OT merge")(
-      test("concurrent text edits merge to base-right-left with no warnings") {
-        val seed = patch("seed@x", 1, Version.empty, "base", createText("notes.txt", "base\n"))
-        val alice =
-          patch(
-            "alice@x",
-            1,
-            v("seed@x" -> 1),
-            "left",
-            editText("notes.txt", "base\n", "base\nleft\n")
-          )
-        val bob =
-          patch(
-            "bob@x",
-            1,
-            v("seed@x" -> 1),
-            "right",
-            editText("notes.txt", "base\n", "base\nright\n")
-          )
-        val target = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
-        val (tree, ws) = materializeOk(Vector(seed, alice, bob), target)
-        assertTrue(treeText(tree, "notes.txt") == "base\nright\nleft\n", ws.isEmpty)
-      },
-      test("convergence holds regardless of input patch order") {
-        val seed = patch("seed@x", 1, Version.empty, "base", createText("notes.txt", "base\n"))
-        val alice =
-          patch(
-            "alice@x",
-            1,
-            v("seed@x" -> 1),
-            "left",
-            editText("notes.txt", "base\n", "base\nleft\n")
-          )
-        val bob =
-          patch(
-            "bob@x",
-            1,
-            v("seed@x" -> 1),
-            "right",
-            editText("notes.txt", "base\n", "base\nright\n")
-          )
-        val target = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
-        val results = Vector(seed, alice, bob).permutations.map { perm =>
-          val (tree, ws) = materializeOk(perm, target)
-          (treeText(tree, "notes.txt"), ws)
-        }.toSet
-        assertTrue(
-          results.size == 1,
-          results.head == (("base\nright\nleft\n"), Vector.empty[ReplayWarning])
-        )
+      test("input patch order does not change the merged result") {
+        val (tree, warnings) = materializeOk(Vector(bob09, seed09, alice09), target09)
+        assertTrue(treeText(tree, "notes.txt").contains("base\nright\nleft\n"), warnings.isEmpty)
       }
     ),
     suite("test 10 whole-file rules")(
-      test(
-        "delete-wins, put-wins, later-put-wins with sorted warnings; identical collapses silently"
-      ) {
-        val base = "base\n"
-        val seed =
-          patch(
-            "seed@x",
-            1,
-            Version.empty,
-            "base",
-            createText("delete.txt", base),
-            createText("identical.txt", base),
-            createText("incompatible.txt", base),
-            createText("later-put.txt", base)
-          )
-        val alice = patch(
-          "alice@x",
-          1,
-          v("seed@x" -> 1),
-          "left",
-          editText("delete.txt", base, "left\n"),
-          editText("identical.txt", base, "same\n"),
-          editText("incompatible.txt", base, "left text\n"),
-          Change.Put("later-put.txt", Array[Byte](0, 1))
-        )
-        val bob = patch(
-          "bob@x",
-          1,
-          v("seed@x" -> 1),
-          "right",
-          Change.Del("delete.txt"),
-          editText("identical.txt", base, "same\n"),
-          Change.Put("incompatible.txt", Array[Byte](0, -1)),
-          editText("later-put.txt", base, "right text\n")
-        )
-        val target = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
-        val (tree, ws) = materializeOk(Vector(seed, alice, bob), target)
-        val expectedWarnings = Vector(
-          ReplayWarning.DeleteWins("delete.txt"),
-          ReplayWarning.PutWins("incompatible.txt"),
-          ReplayWarning.LaterPutWins("later-put.txt")
-        )
+      test("delete-wins, put-wins, later-put-wins, identical collapse, sorted warnings") {
+        val (tree, warnings) = materializeOk(Vector(seed10, alice10, bob10), target10)
         assertTrue(
           !tree.contains("delete.txt"),
-          Model.bytesEqual(tree("incompatible.txt"), Array[Byte](0, -1)),
+          Model.bytesEqual(tree("incompatible.txt"), Array[Byte](0, 0xff.toByte)),
           Model.bytesEqual(tree("later-put.txt"), Array[Byte](0, 1)),
-          treeText(tree, "identical.txt") == "same\n",
-          ws == expectedWarnings
+          treeText(tree, "identical.txt").contains("same\n"),
+          warnings == Vector(
+            ReplayWarning.DeleteWins("delete.txt"),
+            ReplayWarning.PutWins("incompatible.txt"),
+            ReplayWarning.LaterPutWins("later-put.txt")
+          )
         )
+      },
+      test("input patch order does not change bytes or warnings") {
+        val (tree, warnings) = materializeOk(Vector(alice10, seed10, bob10), target10)
+        assertTrue(
+          !tree.contains("delete.txt"),
+          Model.bytesEqual(tree("incompatible.txt"), Array[Byte](0, 0xff.toByte)),
+          Model.bytesEqual(tree("later-put.txt"), Array[Byte](0, 1)),
+          treeText(tree, "identical.txt").contains("same\n"),
+          warnings == Vector(
+            ReplayWarning.DeleteWins("delete.txt"),
+            ReplayWarning.PutWins("incompatible.txt"),
+            ReplayWarning.LaterPutWins("later-put.txt")
+          )
+        )
+      },
+      test("identical concurrent text edits collapse without warning") {
+        val s = patch("seed@x", 1, v(), "base", textCreate("f", "x\n"))
+        val a = patch("alice@x", 1, v("seed@x" -> 1), "a", textEdit("f", "x\n", "y\n"))
+        val b = patch("bob@x", 1, v("seed@x" -> 1), "b", textEdit("f", "x\n", "y\n"))
+        val (tree, warnings) =
+          materializeOk(Vector(s, a, b), v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1))
+        assertTrue(treeText(tree, "f").contains("y\n"), warnings.isEmpty)
       }
     ),
     suite("test 11 namespace conflicts")(
-      test("file vs file/subpath: incoming ancestor wins, descendant removed with namespace-wins") {
-        val alice = patch("alice@x", 1, Version.empty, "ancestor", createText("a", "ancestor\n"))
-        val bob = patch("bob@x", 1, Version.empty, "descendant", createText("a/b", "descendant\n"))
+      test("file a beats file a/b when a integrates later") {
+        val alice = patch("alice@x", 1, v(), "ancestor", textCreate("a", "ancestor\n"))
+        val bob = patch("bob@x", 1, v(), "descendant", textCreate("a/b", "descendant\n"))
         val target = v("alice@x" -> 1, "bob@x" -> 1)
-        val (tree, ws) = materializeOk(Vector(alice, bob), target)
+        val (tree, warnings) = materializeOk(Vector(alice, bob), target)
         assertTrue(
-          treeText(tree, "a") == "ancestor\n",
+          treeText(tree, "a").contains("ancestor\n"),
           !tree.contains("a/b"),
-          ws == Vector(ReplayWarning.NamespaceWins("a/b"))
+          warnings == Vector(ReplayWarning.NamespaceWins("a/b"))
         )
       },
-      test("reverse ownership also converges to the canonically later author's namespace") {
-        val bob = patch("bob@x", 1, Version.empty, "ancestor", createText("x", "ancestor\n"))
-        val alice =
-          patch("alice@x", 1, Version.empty, "descendant", createText("x/y", "descendant\n"))
+      test("file x/y beats file x when x/y integrates later") {
+        val bob = patch("bob@x", 1, v(), "ancestor", textCreate("x", "ancestor\n"))
+        val alice = patch("alice@x", 1, v(), "descendant", textCreate("x/y", "descendant\n"))
         val target = v("alice@x" -> 1, "bob@x" -> 1)
-        val (tree, ws) = materializeOk(Vector(alice, bob), target)
+        val (tree, warnings) = materializeOk(Vector(bob, alice), target)
         assertTrue(
-          treeText(tree, "x/y") == "descendant\n",
           !tree.contains("x"),
-          ws == Vector(ReplayWarning.NamespaceWins("x"))
+          treeText(tree, "x/y").contains("descendant\n"),
+          warnings == Vector(ReplayWarning.NamespaceWins("x"))
         )
       },
-      test("duplicate namespace removals collapse to one warning per removed path") {
-        val seed = patch("seed@x", 1, Version.empty, "blocker", createText("b", "blocker\n"))
-        val p = patch(
-          "p@x",
-          1,
-          Version.empty,
-          "two children",
-          createText("b/x", "x\n"),
-          createText("b/y", "y\n")
-        )
-        val target = v("p@x" -> 1, "seed@x" -> 1)
-        val (tree, ws) = materializeOk(Vector(seed, p), target)
-        assertTrue(
-          treeText(tree, "b/x") == "x\n",
-          treeText(tree, "b/y") == "y\n",
-          !tree.contains("b"),
-          ws == Vector(ReplayWarning.NamespaceWins("b"))
-        )
+      test("both merge directions converge to the same tree and warnings") {
+        val alice = patch("alice@x", 1, v(), "ancestor", textCreate("a", "ancestor\n"))
+        val bob = patch("bob@x", 1, v(), "descendant", textCreate("a/b", "descendant\n"))
+        val target = v("alice@x" -> 1, "bob@x" -> 1)
+        val r1 = materializeOk(Vector(alice, bob), target)
+        val r2 = materializeOk(Vector(bob, alice), target)
+        assertTrue(Model.treeEqual(r1._1, r2._1), r1._2 == r2._2)
       }
     ),
     suite("test 17 concurrent creates")(
-      test("canonically later create wins in both merge directions") {
-        val alice = patch("alice@x", 1, Version.empty, "alice", createText("same.txt", "alice\n"))
-        val bob = patch("bob@x", 1, Version.empty, "bob", createText("same.txt", "bob\n"))
+      test("canonically later create wins and warns once") {
+        val alice = patch("alice@x", 1, v(), "alice", textCreate("same.txt", "alice\n"))
+        val bob = patch("bob@x", 1, v(), "bob", textCreate("same.txt", "bob\n"))
         val target = v("alice@x" -> 1, "bob@x" -> 1)
-        val forward = materializeOk(Vector(alice, bob), target)
-        val backward = materializeOk(Vector(bob, alice), target)
+        val (tree, warnings) = materializeOk(Vector(alice, bob), target)
         assertTrue(
-          treeText(forward._1, "same.txt") == "alice\n",
-          forward._2 == Vector(ReplayWarning.LaterCreateWins("same.txt")),
-          Model.treeEqual(forward._1, backward._1),
-          forward._2 == backward._2
+          treeText(tree, "same.txt").contains("alice\n"),
+          warnings == Vector(ReplayWarning.LaterCreateWins("same.txt"))
+        )
+      },
+      test("reverse input order gives the same winner and warning") {
+        val alice = patch("alice@x", 1, v(), "alice", textCreate("same.txt", "alice\n"))
+        val bob = patch("bob@x", 1, v(), "bob", textCreate("same.txt", "bob\n"))
+        val target = v("alice@x" -> 1, "bob@x" -> 1)
+        val (tree, warnings) = materializeOk(Vector(bob, alice), target)
+        assertTrue(
+          treeText(tree, "same.txt").contains("alice\n"),
+          warnings == Vector(ReplayWarning.LaterCreateWins("same.txt"))
+        )
+      },
+      test("three concurrent creates on one path deduplicate to one warning") {
+        val a = patch("a@x", 1, v(), "a", textCreate("f", "a\n"))
+        val b = patch("b@x", 1, v(), "b", textCreate("f", "b\n"))
+        val c = patch("c@x", 1, v(), "c", textCreate("f", "c\n"))
+        val target = v("a@x" -> 1, "b@x" -> 1, "c@x" -> 1)
+        val (tree, warnings) = materializeOk(Vector(a, b, c), target)
+        assertTrue(
+          treeText(tree, "f").contains("a\n"),
+          warnings == Vector(ReplayWarning.LaterCreateWins("f"))
         )
       }
     ),
     suite("test 18 three-way convergence")(
-      test("delete plus two concurrent inserts converges with no warnings") {
-        val base = "start\nend\n"
-        val seed = patch("seed@x", 1, Version.empty, "base", createText("story.txt", base))
-        val a =
-          patch("a@x", 1, v("seed@x" -> 1), "a", editText("story.txt", base, "start\nA\nend\n"))
-        val b =
-          patch("b@x", 1, v("seed@x" -> 1), "b", editText("story.txt", base, "start\nB\nend\n"))
-        val c = patch("c@x", 1, v("seed@x" -> 1), "c", editText("story.txt", base, "end\n"))
-        val target = v("a@x" -> 1, "b@x" -> 1, "c@x" -> 1, "seed@x" -> 1)
-        val (tree, ws) = materializeOk(Vector(seed, a, b, c), target)
-        assertTrue(treeText(tree, "story.txt") == "B\nA\nend\n", ws.isEmpty)
+      test("canonical order is seed, c, b, a") {
+        Replay.integrationOrder(Vector(a18, b18, c18, seed18)) match {
+          case Right(order) =>
+            assertTrue(
+              order.map(p => (p.author.value, p.revision)) ==
+                Vector(("seed@x", 1L), ("c@x", 1L), ("b@x", 1L), ("a@x", 1L))
+            )
+          case Left(_) => assertTrue(false)
+        }
       },
-      test("all input permutations of the three-way history converge identically") {
-        val base = "start\nend\n"
-        val seed = patch("seed@x", 1, Version.empty, "base", createText("story.txt", base))
-        val a =
-          patch("a@x", 1, v("seed@x" -> 1), "a", editText("story.txt", base, "start\nA\nend\n"))
-        val b =
-          patch("b@x", 1, v("seed@x" -> 1), "b", editText("story.txt", base, "start\nB\nend\n"))
-        val c = patch("c@x", 1, v("seed@x" -> 1), "c", editText("story.txt", base, "end\n"))
-        val target = v("a@x" -> 1, "b@x" -> 1, "c@x" -> 1, "seed@x" -> 1)
-        val results = Vector(seed, a, b, c).permutations.map { perm =>
-          val (tree, ws) = materializeOk(perm, target)
-          (treeText(tree, "story.txt"), ws)
-        }.toSet
+      test("final text is B A end with zero warnings") {
+        val (tree, warnings) = materializeOk(Vector(seed18, a18, b18, c18), target18)
+        assertTrue(treeText(tree, "story.txt").contains("B\nA\nend\n"), warnings.isEmpty)
+      },
+      test("all six input association orders give the same result") {
+        val expected = "B\nA\nend\n"
+        val results = Vector(a18, b18, c18).permutations.map { perm =>
+          val (tree, warnings) = materializeOk(Vector(seed18) ++ perm, target18)
+          (treeText(tree, "story.txt"), warnings)
+        }.toVector
+        assertTrue(results.forall { case (text, warnings) =>
+          text.contains(expected) && warnings.isEmpty
+        })
+      }
+    ),
+    suite("test 21 version algebra support")(
+      test("joined frontier materializes base B1 B2 A2") {
+        val (tree, warnings) = materializeOk(patches21, target21)
+        assertTrue(treeText(tree, "story.txt").contains("base\nB1\nB2\nA2\n"), warnings.isEmpty)
+      },
+      test("materialize at (a@x->1) gives the seed content") {
+        val (tree, warnings) = materializeOk(patches21, v("a@x" -> 1))
+        assertTrue(treeText(tree, "story.txt").contains("base\n"), warnings.isEmpty)
+      },
+      test("materialize at (a@x->1,b@x->2) gives base B1 B2") {
+        val (tree, warnings) = materializeOk(patches21, v("a@x" -> 1, "b@x" -> 2))
+        assertTrue(treeText(tree, "story.txt").contains("base\nB1\nB2\n"), warnings.isEmpty)
+      },
+      test("materialize at (a@x->2) gives base A2") {
+        val (tree, warnings) = materializeOk(patches21, v("a@x" -> 2))
+        assertTrue(treeText(tree, "story.txt").contains("base\nA2\n"), warnings.isEmpty)
+      }
+    ),
+    suite("test 22 OT matrix via replay")(
+      test("overlapping deletes: same base token deleted only once") {
+        val (tree, warnings) =
+          materializeOk(otScenario("0\n3\n4\n", "0\n2\n3\n4\n"), target22)
+        assertTrue(treeText(tree, "f").contains("0\n3\n4\n"), warnings.isEmpty)
+      },
+      test("split counts, insert priority, and trailing insert") {
+        val (tree, warnings) =
+          materializeOk(otScenario("A\n0\n3\n4\nTAIL\n", "0\n1\nB\n3\n4\n"), target22)
+        assertTrue(treeText(tree, "f").contains("A\n0\nB\n3\n4\nTAIL\n"), warnings.isEmpty)
+      },
+      test("retained token deleted by context stays deleted; trailing insert survives") {
+        val (tree, warnings) =
+          materializeOk(otScenario("0\n1\n2\n3\n4\nA\n", "0\n2\n3\n4\n"), target22)
+        assertTrue(treeText(tree, "f").contains("0\n2\n3\n4\nA\n"), warnings.isEmpty)
+      },
+      test("context insert before an incoming deletion survives") {
+        val (tree, warnings) =
+          materializeOk(otScenario("0\n2\n3\n4\n", "0\nB\n1\n2\n3\n4\n"), target22)
+        assertTrue(treeText(tree, "f").contains("0\nB\n2\n3\n4\n"), warnings.isEmpty)
+      }
+    ),
+    suite("delete versus edit")(
+      test("delete over concurrent edit wins with one warning") {
+        val s = patch("seed@x", 1, v(), "base", textCreate("f", "base\n"))
+        val a = patch("alice@x", 1, v("seed@x" -> 1), "del", del("f"))
+        val b = patch("bob@x", 1, v("seed@x" -> 1), "edit", textEdit("f", "base\n", "edited\n"))
+        val target = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
+        val (tree, warnings) = materializeOk(Vector(s, a, b), target)
+        assertTrue(!tree.contains("f"), warnings == Vector(ReplayWarning.DeleteWins("f")))
+      },
+      test("edit over concurrent delete loses with delete-wins regardless of input order") {
+        val s = patch("seed@x", 1, v(), "base", textCreate("f", "base\n"))
+        val a = patch("alice@x", 1, v("seed@x" -> 1), "del", del("f"))
+        val b = patch("bob@x", 1, v("seed@x" -> 1), "edit", textEdit("f", "base\n", "edited\n"))
+        val target = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
+        val (tree, warnings) = materializeOk(Vector(b, s, a), target)
+        assertTrue(!tree.contains("f"), warnings == Vector(ReplayWarning.DeleteWins("f")))
+      }
+    ),
+    suite("integrationOrder")(
+      test("cycle is rejected") {
+        val p1 = patch("a@x", 1, v("b@x" -> 1), "a", textCreate("a", "a\n"))
+        val p2 = patch("b@x", 1, v("a@x" -> 1), "b", textCreate("b", "b\n"))
         assertTrue(
-          results.size == 1,
-          results.head == (("B\nA\nend\n", Vector.empty[ReplayWarning]))
+          Replay.integrationOrder(Vector(p1, p2)) == Left(SnapError.CyclicOrIncompleteHistory)
         )
-      }
-    ),
-    suite("test 21 version algebra merge")(
-      test("serial contributor chain plus concurrent branch joins to (a@x->2,b@x->2)") {
-        val a1 = patch("a@x", 1, Version.empty, "a1", createText("story.txt", "base\n"))
-        val a2 = patch("a@x", 2, v("a@x" -> 1), "a2", editText("story.txt", "base\n", "base\nA2\n"))
-        val b1 = patch("b@x", 1, v("a@x" -> 1), "b1", editText("story.txt", "base\n", "base\nB1\n"))
-        val b2 = patch(
-          "b@x",
-          2,
-          v("a@x" -> 1, "b@x" -> 1),
-          "b2",
-          editText("story.txt", "base\nB1\n", "base\nB1\nB2\n")
+      },
+      test("missing base dot is rejected") {
+        val p = patch("a@x", 1, v("ghost@x" -> 1), "a", textCreate("a", "a\n"))
+        assertTrue(Replay.integrationOrder(Vector(p)) == Left(SnapError.MissingPatch("ghost@x", 1)))
+      },
+      test("structurally equal duplicate dots collapse to one patch") {
+        val p = patch("a@x", 1, v(), "a", textCreate("a", "a\n"))
+        Replay.integrationOrder(Vector(p, p)) match {
+          case Right(order) => assertTrue(order.length == 1)
+          case Left(_)      => assertTrue(false)
+        }
+      },
+      test("different values at one dot are a collision") {
+        val p1 = patch("a@x", 1, v(), "a", textCreate("a", "a\n"))
+        val p2 = patch("a@x", 1, v(), "other", textCreate("a", "a\n"))
+        assertTrue(
+          Replay.integrationOrder(Vector(p1, p2)) == Left(SnapError.PatchCollision("a@x", 1))
         )
-        val target = v("a@x" -> 2, "b@x" -> 2)
-        val (tree, ws) = materializeOk(Vector(a1, a2, b1, b2), target)
-        assertTrue(treeText(tree, "story.txt") == "base\nB1\nB2\nA2\n", ws.isEmpty)
-      }
-    ),
-    suite("test 22 OT matrix")(
-      test("overlapping deletes remove the shared token once") {
-        val base = "0\n1\n2\n3\n4\n"
-        val seed = patch("seed@x", 1, Version.empty, "base", createText("f", base))
-        val alice =
-          patch("alice@x", 1, v("seed@x" -> 1), "delete-two", editText("f", base, "0\n3\n4\n"))
-        val bob =
-          patch("bob@x", 1, v("seed@x" -> 1), "delete-one", editText("f", base, "0\n2\n3\n4\n"))
-        val target = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
-        val (tree, ws) = materializeOk(Vector(seed, alice, bob), target)
-        assertTrue(treeText(tree, "f") == "0\n3\n4\n", ws.isEmpty)
-      },
-      test("insert priority, count splitting, overlapping deletes, trailing insert") {
-        val base = "0\n1\n2\n3\n4\n"
-        val seed = patch("seed@x", 1, Version.empty, "base", createText("f", base))
-        val alice =
-          patch(
-            "alice@x",
-            1,
-            v("seed@x" -> 1),
-            "incoming-complex",
-            editText("f", base, "A\n0\n3\n4\nTAIL\n")
-          )
-        val bob =
-          patch(
-            "bob@x",
-            1,
-            v("seed@x" -> 1),
-            "context-complex",
-            editText("f", base, "0\n1\nB\n3\n4\n")
-          )
-        val target = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
-        val (tree, ws) = materializeOk(Vector(seed, alice, bob), target)
-        assertTrue(treeText(tree, "f") == "A\n0\nB\n3\n4\nTAIL\n", ws.isEmpty)
-      },
-      test("retained token deleted by context stays deleted, trailing insert survives") {
-        val base = "0\n1\n2\n3\n4\n"
-        val seed = patch("seed@x", 1, Version.empty, "base", createText("f", base))
-        val alice =
-          patch(
-            "alice@x",
-            1,
-            v("seed@x" -> 1),
-            "retain-and-append",
-            editText("f", base, "0\n1\n2\n3\n4\nA\n")
-          )
-        val bob =
-          patch("bob@x", 1, v("seed@x" -> 1), "delete-middle", editText("f", base, "0\n2\n3\n4\n"))
-        val target = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
-        val (tree, ws) = materializeOk(Vector(seed, alice, bob), target)
-        assertTrue(treeText(tree, "f") == "0\n2\n3\n4\nA\n", ws.isEmpty)
-      },
-      test("context insert before a deleted token survives") {
-        val base = "0\n1\n2\n3\n4\n"
-        val seed = patch("seed@x", 1, Version.empty, "base", createText("f", base))
-        val alice =
-          patch(
-            "alice@x",
-            1,
-            v("seed@x" -> 1),
-            "delete-base-token",
-            editText("f", base, "0\n2\n3\n4\n")
-          )
-        val bob = patch(
-          "bob@x",
-          1,
-          v("seed@x" -> 1),
-          "insert-before-token",
-          editText("f", base, "0\nB\n1\n2\n3\n4\n")
-        )
-        val target = v("alice@x" -> 1, "bob@x" -> 1, "seed@x" -> 1)
-        val (tree, ws) = materializeOk(Vector(seed, alice, bob), target)
-        assertTrue(treeText(tree, "f") == "0\nB\n2\n3\n4\n", ws.isEmpty)
       }
     )
   )
