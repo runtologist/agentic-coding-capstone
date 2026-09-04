@@ -110,3 +110,4 @@ After any sbt config change: `sbt --client shutdown` first.
 | 2026-09-05 | F wave-1 | F-cmd (task/13-command-hygiene @ 2e9f4e2) verified and merged to main as e65eb29. flushErr added, SNAP_DEBUG via CmdEnv, nextRevision wired, while-loops idiomatised. Post-merge gate green: 517 tests, 28/28 harness. | merge e65eb29 |
 | 2026-09-05 | F wave-1b | F-utf8b (task/15-lazy-jnu-reexec @ 23a1f85) verified and merged to main as f0e7bc6. Lazy re-exec replaces eager re-exec; Jnu.scala + JnuSpec (13 tests). Post-merge gate green: 530 tests, 28/28 harness. | merge f0e7bc6 |
 | 2026-09-05 | F gate | Post-all-merges gate on main @ 5ebb965: 530 tests passed, assembly built, scalafmt clean, harness 28/28 in 99.7s | bg b751fa951 exit 0 |
+| 2026-09-05 | Coverage | §10 coverage protocol complete: statement coverage 90.43%, branch coverage 85.62% (target ≥80%). Report at snap/target/scala-3.3.8/scoverage-report/. | bg b3f02b4ef |
