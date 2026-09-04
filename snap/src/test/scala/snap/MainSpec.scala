@@ -136,6 +136,71 @@ object MainSpec extends ZIOSpecDefault {
           } yield assertTrue(r == ((0, "snap 1.0.0\n", "")))
         }
       }
+    ),
+    suite("jnuNeedsReexec decision (F-utf8)")(
+      test("ASCII encoding + no guard + jar path → re-exec needed") {
+        assertTrue(
+          Main.jnuNeedsReexec(Some("ANSI_X3.4-1968"), None, Some("/app/snap-assembly-0.1.0.jar"))
+        )
+      },
+      test("UTF-8 encoding → no re-exec") {
+        assertTrue(
+          !Main.jnuNeedsReexec(Some("UTF-8"), None, Some("/app/snap.jar"))
+        )
+      },
+      test("lowercase utf8 encoding → no re-exec") {
+        assertTrue(
+          !Main.jnuNeedsReexec(Some("utf8"), None, Some("/app/snap.jar"))
+        )
+      },
+      test("guard env set → no re-exec even with ASCII encoding") {
+        assertTrue(
+          !Main.jnuNeedsReexec(Some("ANSI_X3.4-1968"), Some("1"), Some("/app/snap.jar"))
+        )
+      },
+      test("classes directory (not jar) → no re-exec") {
+        assertTrue(
+          !Main.jnuNeedsReexec(Some("ANSI_X3.4-1968"), None, Some("/app/target/classes/"))
+        )
+      },
+      test("None encoding → no re-exec (assume fine)") {
+        assertTrue(
+          !Main.jnuNeedsReexec(None, None, Some("/app/snap.jar"))
+        )
+      },
+      test("None jar path → no re-exec (sbt run/test)") {
+        assertTrue(
+          !Main.jnuNeedsReexec(Some("ANSI_X3.4-1968"), None, None)
+        )
+      }
+    ),
+    suite("reexecCommand builder (F-utf8)")(
+      test("builds exact command list with flags and arg passthrough") {
+        val cmd = Main.reexecCommand("/opt/java", "/app/snap.jar", Seq("status", "--verbose"))
+        assertTrue(
+          cmd == List(
+            "/opt/java/bin/java",
+            "-Dsun.misc.unsafe.memory.access=allow",
+            "-Dfile.encoding=UTF-8",
+            "-jar",
+            "/app/snap.jar",
+            "status",
+            "--verbose"
+          )
+        )
+      },
+      test("handles empty args") {
+        val cmd = Main.reexecCommand("/opt/java", "/app/snap.jar", Seq.empty)
+        assertTrue(
+          cmd == List(
+            "/opt/java/bin/java",
+            "-Dsun.misc.unsafe.memory.access=allow",
+            "-Dfile.encoding=UTF-8",
+            "-jar",
+            "/app/snap.jar"
+          )
+        )
+      }
     )
   )
 }
