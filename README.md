@@ -21,7 +21,6 @@ against its own `SPEC.md` and acceptance tests.
 ## Layout
 
 ```text
-capstone-scala/
   .github/workflows/   # CI: sbt gate suite + vendored acceptance harness per project
   docs/                # Generic plan + per-capstone records
     GENERIC_CAPSTONE_PLAN.md  # the playbook every capstone follows
@@ -48,18 +47,23 @@ CI installs Java/sbt itself.
 
 ## Building and verifying
 
-Full workflow, quality gates, and ground rules live in the
-[plan](docs/GENERIC_CAPSTONE_PLAN.md). Per-project quick reference:
+In the workshop root:
 
 ```bash
-cd <capstone>
-sbt --client test assembly   # unit gates
+git clone git@github.com:runtologist/.git
+```
+```
 
-# Canonical acceptance validation (from the workshop root):
-./capstones/snap/verify --candidate capstone-scala/scripts/snap
+then 
+```
 
-# Or via the vendored harness (from the repo root):
-bash harness/<capstone>/run_tests --lang scala --implementation-root $PWD/<capstone>
+```bash
+cd agentic-coding-capstone/snap 
+sbt test assembly
+cd ../..
+# Canonical acceptance validation
+../capstones/snap/verify --candidate scripts/snap
+
 ```
 
 The `scripts/snap` launcher passes `-Dsun.misc.unsafe.memory.access=allow`
