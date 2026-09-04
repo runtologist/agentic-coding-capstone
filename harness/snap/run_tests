@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+HARNESS_DIR="$PROJECT_ROOT/test-harness"
+export SNAP_HARNESS_CALLER_CWD="$PWD"
+lang=""
+implementation_root=""
+passthrough=()
+
+die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --lang) [ $# -ge 2 ] || die "--lang requires ts, rust, or scala"; lang="$2"; shift 2 ;;
+    --implementation-root) [ $# -ge 2 ] || die "--implementation-root requires a path"; implementation_root="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: run_tests --lang ts|rust|scala --implementation-root PATH [--filter TEXT] [--verbose] [--keep-failed] [--summary PATH] [--list]"
+      exit 0
+      ;;
+    *) passthrough+=("$1"); shift ;;
+  esac
+done
+
+case "$lang" in ts|rust|scala) ;; *) die "--lang must be explicitly set to ts, rust, or scala" ;; esac
+[ -n "$implementation_root" ] || die "--implementation-root is required"
+[ -d "$implementation_root" ] || die "implementation root not found: $implementation_root"
+implementation_root="$(cd "$implementation_root" && pwd)"
+
+command -v node >/dev/null || die "node is not installed"
+command -v npx >/dev/null || die "npx is not installed"
+if [ ! -d "$HARNESS_DIR/node_modules" ]; then
+  printf '\033[1;34m=>\033[0m Installing Snap test-harness dependencies (first run)…\n' >&2
+  (cd "$HARNESS_DIR" && npm install --silent)
+fi
+
+# Build the implementation and locate the runnable artifact. This vendored
+# harness drives the language-neutral YAML suite through a single executable
+# wrapper passed as --candidate, mirroring the upstream Snap verifier.
+wrapper="$(mktemp "${TMPDIR:-/tmp}/snap-${lang}.XXXXXX")"
+trap 'rm -f "$wrapper"' EXIT
+
+case "$lang" in
+  scala)
+    jar="$(find "$implementation_root/target" -path '*/scala-*/*-assembly-*.jar' -type f 2>/dev/null | head -n 1)"
+    if [ -z "$jar" ] || [ -n "$(find "$implementation_root/src" "$implementation_root/build.sbt" -type f -newer "$jar" -print -quit 2>/dev/null)" ]; then
+      printf '\033[1;34m=>\033[0m Building snap assembly (sbt)…\n' >&2
+      (cd "$implementation_root" && sbt -batch assembly >/dev/null)
+      jar="$(find "$implementation_root/target" -path '*/scala-*/*-assembly-*.jar' -type f | head -n 1)"
+    fi
+    [ -n "$jar" ] || die "could not locate snap assembly jar under $implementation_root/target"
+    # -Dsun.misc.unsafe.memory.access=allow silences Java 25's sun.misc.Unsafe
+    # deprecation WARNINGs (emitted by Scala 3.3.x LazyVals) to stderr; Snap's
+    # suite asserts stderr_equals "" on success paths, so they must not leak.
+    printf '#!/bin/sh\nexec java -Dsun.misc.unsafe.memory.access=allow -jar "%s" "$@"\n' "$jar" > "$wrapper"
+    ;;
+  *)
+    die "this workspace only implements the Scala edition; use --lang scala"
+    ;;
+esac
+
+chmod +x "$wrapper"
+
+cd "$HARNESS_DIR"
+exec npx tsx src/cli.ts --candidate "$wrapper" "${passthrough[@]+"${passthrough[@]}"}"
