@@ -1,5 +1,6 @@
 package snap
 
+import zio.*
 import zio.test.*
 
 import snap.Model.*
@@ -101,6 +102,78 @@ object DiffSpec extends ZIOSpecDefault {
           countsPositive
         )
       }
+    },
+    test("large diff beyond the old 64M-cell cap completes and round-trips") {
+      // 8100 x 8100 = 65.61M cells exceeds the former MaxDiffCells budget.
+      val n = 8100
+      val old = Vector.tabulate(n)(i => s"old-line-$i\n")
+      val nw = Vector.tabulate(n)(i => s"new-line-$i\n")
+      val script = Diff.canonicalDiff(old, nw)
+      assertTrue(
+        Model.applyEdit(old, script, "big.txt") == Right(nw),
+        Model.hasAdjacentSameKind(script).isEmpty,
+        script.forall {
+          case Retain(k)      => k > 0
+          case Delete(k)      => k > 0
+          case Insert(tokens) => tokens.nonEmpty && tokens.forall(Model.isValidInsertToken)
+        },
+        // fully disjoint alphabets: canonical script is one coalesced delete + one coalesced insert
+        script == Vector(Delete(n.toLong), Insert(nw))
+      )
+    } @@ TestAspect.timeout(5.minutes),
+    test("matches naive reference on randomized tie-heavy inputs (deterministic seed)") {
+      val rng = new scala.util.Random(0x5eedL)
+      val alphabet = Vector("a\n", "b\n")
+      val cases = (1 to 300).map { _ =>
+        val oldLen = rng.nextInt(121)
+        val newLen = rng.nextInt(121)
+        val old = Vector.fill(oldLen)(alphabet(rng.nextInt(alphabet.length)))
+        val nw = Vector.fill(newLen)(alphabet(rng.nextInt(alphabet.length)))
+        (old, nw)
+      }
+      val mismatches = cases.filter { case (old, nw) =>
+        Diff.canonicalDiff(old, nw) != naiveDiff(old, nw)
+      }
+      assertTrue(mismatches.isEmpty)
+    },
+    test("apply-roundtrip on randomized tie-heavy inputs (deterministic seed)") {
+      val rng = new scala.util.Random(0xd1ffL)
+      val alphabet = Vector("a\n", "b\n")
+      val cases = (1 to 300).map { _ =>
+        val oldLen = rng.nextInt(121)
+        val newLen = rng.nextInt(121)
+        val old = Vector.fill(oldLen)(alphabet(rng.nextInt(alphabet.length)))
+        val nw = Vector.fill(newLen)(alphabet(rng.nextInt(alphabet.length)))
+        (old, nw)
+      }
+      val failures = cases.filter { case (old, nw) =>
+        Model.applyEdit(old, Diff.canonicalDiff(old, nw), "f") != Right(nw)
+      }
+      assertTrue(failures.isEmpty)
+    },
+    test("randomized inputs with repeated equal runs match naive reference (deterministic seed)") {
+      val rng = new scala.util.Random(0xabcdL)
+      val cases = (1 to 200).map { _ =>
+        // build runs of repeated tokens to stress diagonal/tie interaction
+        def run(): Vector[String] = {
+          val buf = Vector.newBuilder[String]
+          val nRuns = rng.nextInt(9)
+          var k = 0
+          while (k < nRuns) {
+            val tok = if (rng.nextBoolean()) "a\n" else "b\n"
+            val len = 1 + rng.nextInt(15)
+            var c = 0
+            while (c < len) { buf += tok; c += 1 }
+            k += 1
+          }
+          buf.result()
+        }
+        (run(), run())
+      }
+      val mismatches = cases.filter { case (old, nw) =>
+        Diff.canonicalDiff(old, nw) != naiveDiff(old, nw)
+      }
+      assertTrue(mismatches.isEmpty)
     }
   ) @@ TestAspect.samples(64)
 
