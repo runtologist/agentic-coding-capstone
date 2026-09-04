@@ -2,22 +2,60 @@
 
 ![CI](https://github.com/runtologist/agentic-coding-capstone/actions/workflows/capstone-ci.yml/badge.svg)
 
-This repository contains generated Scala code, planning documents, and scripts
-for the workshop capstone. The intended capstone is **Snap**. TabbyShell is
-used as a practice project to validate the toolchain, harness interface,
-generic plan, and parallel-subagent workflow.
+Generated Scala implementations of the workshop capstone projects, built by
+AI coding agents following a single reusable playbook.
+
+## Approach
+
+The core artifact of this repository is a generic delivery plan,
+[`docs/GENERIC_CAPSTONE_PLAN.md`](docs/GENERIC_CAPSTONE_PLAN.md). It defines
+the non-negotiable quality gates, the phased subagent workflow (intake →
+architecture derivation → parallel implementation → integration → adversarial
+review → fix rounds), the git workflow, and lessons learned from previous
+capstones.
+
+The plan was **derived and validated on TabbyShell**, the workshop's practice
+capstone. Each subsequent capstone is executed by instantiating the same plan
+against its own `SPEC.md` and acceptance tests.
 
 ## Layout
 
 ```text
 capstone-scala/
-  .github/workflows/    # CI: sbt tests + generic acceptance suite per project
-  docs/                 # Generic plan, contracts, findings, task templates
-  harness/              # Vendored, unmodified workshop acceptance harnesses
-    tabbyshell/         #   (verify, run_tests, test-harness, tests, fixtures)
-  scripts/              # Environment and verification helper scripts
-  tabbyshell/           # Practice Scala implementation for TabbyShell
-  snap/                 # Future Snap implementation, created when spec is available
+  .github/workflows/   # CI: sbt gate suite + vendored acceptance harness per project
+  docs/                # Generic plan + per-capstone records
+    GENERIC_CAPSTONE_PLAN.md  # the playbook every capstone follows
+    TASK_PACKET_TEMPLATE.md   # task-packet template for implementation subagents
+    tabbyshell/               # TabbyShell contract, task packets, ledger, findings
+    examples/                 # architecture case studies (e.g. TabbyShell)
+  harness/             # Vendored, unmodified workshop acceptance harnesses
+    tabbyshell/        #   harness for TabbyShell (more added per capstone)
+  <capstone>/          # One Scala project per capstone (tabbyshell, snap, ...)
+```
+
+## Current status
+
+| Capstone              | Status                          | Evidence                                        |
+| --------------------- | ------------------------------- | ----------------------------------------------- |
+| TabbyShell (practice) | done                            | 50/50 acceptance cases, 411 unit tests, 91.9% statement coverage — see [`docs/tabbyshell/LEDGER.md`](docs/tabbyshell/LEDGER.md) |
+| Snap                  | pending — spec not yet released | —                                                |
+
+## Environment
+
+Requires Java 25 LTS and sbt 1.10.x on `PATH`. Locally I use a gitignored
+`scripts/env.sh` that points `JAVA_HOME` at the Homebrew OpenJDK 25 install;
+CI installs Java/sbt itself.
+
+## Building and verifying
+
+Full workflow, quality gates, and ground rules live in the
+[plan](docs/GENERIC_CAPSTONE_PLAN.md). Per-project quick reference:
+
+```bash
+cd <capstone>
+sbt --client test assembly   # unit gates
+# acceptance suite: bash harness/<capstone>/run_tests --lang scala \
+#   --implementation-root $PWD/<capstone>
 ```
 
 ## Continuous Integration
@@ -27,46 +65,10 @@ containing a `build.sbt` and, for each project, runs:
 
 1. `sbt scalafmtCheckAll; test; assembly` — formatting gate, unit tests, fat
    jar.
-2. The matching vendored acceptance harness at `harness/<project>/run_tests`
-   (skipped if no harness is vendored for that project yet).
+2. The vendored acceptance harness at `harness/<project>/run_tests` (skipped
+   until a harness is vendored for that project).
 
-New capstones are picked up automatically: add `<name>/build.sbt` and vendor
-the workshop harness into `harness/<name>/`.
-
-## Environment
-
-Use the latest LTS Java installed via Homebrew:
-
-```bash
-source scripts/env.sh
-java -version
-```
-
-Expected: OpenJDK 25.x LTS.
-
-## TabbyShell practice verification
-
-Build the Scala assembly and run a harness smoke test:
-
-```bash
-source scripts/env.sh
-cd tabbyshell
-sbt --client test assembly
-./scripts/smoke-tabbyshell.sh
-```
-
-Full TabbyShell verification, once implementation is complete:
-
-```bash
-./scripts/verify-tabbyshell.sh
-```
-
-## Rules
-
-- The project specification and provided acceptance tests are the contract.
-- Do not modify provided workshop test harnesses unless explicitly instructed.
-- Every meaningful change must produce automated evidence: compile, tests,
-  assembly, and acceptance-harness output.
-- Parallel subagents work in separate git worktrees and must not edit the same
-  files concurrently.
-- Keep side effects explicit and boundary-parsed; prefer ADTs and typed errors.
+Test counts are summarized on the run's **Summary** page and full logs are
+uploaded as artifacts. The harness step fails the build unless every vendored
+test case passes. Adding a new capstone only requires `<name>/build.sbt` and
+`harness/<name>/`; the workflow needs no changes.
