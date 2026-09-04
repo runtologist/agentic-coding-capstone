@@ -1,316 +1,392 @@
 package snap
 
-/** Minimal strict JSON layer for Snap.
+import zio.Chunk
+import zio.json.*
+import zio.json.ast.{Json => ZJson}
+
+import java.math.{BigDecimal => JBigDecimal}
+
+/** JSON layer for Snap built on zio-json's AST.
   *
   * Parsing:
-  *   - full RFC 8259 grammar (objects, arrays, strings with \u escapes, numbers, literals)
-  *   - duplicate object keys are rejected (SPEC §4.1 "Valid input has unique object keys")
-  *   - trailing content after the top-level value is rejected in strict mode but tolerated in
-  *     lenient mode (config files only — see docs/snap/CONTRACT.md §15 ruling A)
-  *   - numbers keep their raw literal so integer-literal exactness can be enforced later
+  *   - decoding is delegated to zio-json's `zio.json.ast.Json` decoder
+  *   - duplicate object keys are rejected by walking the decoded AST (SPEC §4.1 "Valid input has
+  *     unique object keys"); zio-json preserves duplicates in `Json.Obj.fields`
+  *   - strict mode rejects trailing content after the top-level value; config mode tolerates it
+  *     (docs/snap/CONTRACT.md §15 ruling A)
+  *   - integer fields are validated as positive safe integers from the AST's `BigDecimal`
   *
   * Writing:
-  *   - `renderPretty` reproduces Node's `JSON.stringify(value, null, 2)` plus a trailing LF, which
-  *     the `--serve` snapshot test pins byte-for-byte.
+  *   - `writeCanonical` reproduces Node's `JSON.stringify(value, null, 2)` plus a trailing LF,
+  *     which the `--serve` snapshot test pins byte-for-byte.
   */
 object Json {
 
+  /** Parsed JSON AST used by the codec layer. */
+  type Value = ZJson
+
   // ---------------------------------------------------------------------------
-  // AST
+  // Constructors used when writing canonical repository/config JSON
   // ---------------------------------------------------------------------------
 
-  sealed trait Value
+  def obj(fields: (String, Value)*): Value = ZJson.Obj(Chunk.fromIterable(fields))
 
-  case object JNull extends Value
-  final case class JBool(value: Boolean) extends Value
+  def arr(items: Value*): Value = ZJson.Arr(Chunk.fromIterable(items))
 
-  /** A JSON number keeping its raw literal so callers can distinguish `1` from `1.5`/`1e2`. */
-  final case class JNum(raw: String) extends Value {
-    def isIntegralLiteral: Boolean = JNum.Integral.matches(raw)
-    def asLong: Option[Long] =
-      if (isIntegralLiteral) scala.util.Try(raw.toLong).toOption else None
-  }
-  object JNum {
-    private val Integral = "^-?(?:0|[1-9][0-9]*)$".r
-    def of(n: Long): JNum = JNum(n.toString)
-  }
+  def str(s: String): Value = ZJson.Str(s)
 
-  final case class JStr(value: String) extends Value
-  final case class JArr(items: Vector[Value]) extends Value
-  final case class JObj(entries: Vector[(String, Value)]) extends Value {
-    def get(key: String): Option[Value] = entries.find(_._1 == key).map(_._2)
-    def keys: Vector[String] = entries.map(_._1)
-  }
+  def num(n: Long): Value = ZJson.Num(JBigDecimal.valueOf(n))
+
+  def bool(b: Boolean): Value = ZJson.Bool(b)
+
+  val nul: Value = ZJson.Null
 
   // ---------------------------------------------------------------------------
   // Parsing
   // ---------------------------------------------------------------------------
 
-  /** Parse one JSON document.
-    *
-    * @param source
-    *   label used in error messages (e.g. file path or "response body")
-    * @param allowTrailing
-    *   when true, bytes after the first complete value are ignored
+  /** Parse one complete JSON document strictly: malformed input, duplicate keys, and trailing
+    * content are errors.
     */
-  def parse(
+  def parseStrict(input: String, source: String): Either[SnapError, Value] =
+    parseImpl(input, source, allowTrailing = false)
+
+  /** Parse a configuration document: duplicate keys and malformed input are errors, but bytes after
+    * the first complete JSON value are tolerated (CONTRACT §15 ruling A).
+    */
+  def parseConfig(input: String, source: String): Either[SnapError, Value] =
+    parseImpl(input, source, allowTrailing = true)
+
+  private def parseImpl(
       input: String,
       source: String,
-      allowTrailing: Boolean = false
+      allowTrailing: Boolean
   ): Either[SnapError, Value] =
-    new Parser(input, source, allowTrailing).run()
+    input.fromJson[ZJson] match {
+      case Left(err) => Left(SnapError.InvalidJson(s"$source: $err"))
+      case Right(json) =>
+        findDuplicateKey(json) match {
+          case Some(name) => Left(SnapError.DuplicateJsonKey(name))
+          case None =>
+            if (allowTrailing) Right(json)
+            else
+              firstValueEnd(input) match {
+                case Some(end)
+                    if input
+                      .substring(end)
+                      .forall(c => c == ' ' || c == '\t' || c == '\n' || c == '\r') =>
+                  Right(json)
+                case Some(_) =>
+                  Left(SnapError.InvalidJson(s"$source: trailing content after JSON value"))
+                case None =>
+                  Left(SnapError.InvalidJson(s"$source: unable to locate end of JSON value"))
+              }
+        }
+    }
 
-  private final class Malformed(val reason: String) extends RuntimeException
+  /** First duplicated object key in document order, if any. zio-json's AST preserves duplicate
+    * members, so uniqueness is enforced here.
+    */
+  private def findDuplicateKey(json: Value): Option[String] =
+    json match {
+      case ZJson.Obj(fields) =>
+        val seen = scala.collection.mutable.HashSet.empty[String]
+        val it = fields.iterator
+        var result: Option[String] = None
+        while (it.hasNext && result.isEmpty) {
+          val (key, value) = it.next()
+          if (!seen.add(key)) result = Some(key)
+          else result = findDuplicateKey(value)
+        }
+        result
+      case ZJson.Arr(items) =>
+        val it = items.iterator
+        var result: Option[String] = None
+        while (it.hasNext && result.isEmpty) result = findDuplicateKey(it.next())
+        result
+      case _ => None
+    }
 
-  private final class Parser(input: String, source: String, allowTrailing: Boolean) {
-    private var pos = 0
+  /** Index just past the first complete top-level JSON value. Assumes `input` has already parsed
+    * successfully; this only locates the value boundary so strict mode can detect trailing bytes.
+    */
+  private def firstValueEnd(s: String): Option[Int] = {
+    var pos = 0
+    val n = s.length
 
-    def run(): Either[SnapError, Value] =
-      try {
-        skipWs()
-        val v = parseValue()
-        skipWs()
-        if (!allowTrailing && pos < input.length)
-          throw new Malformed(s"trailing content at offset $pos")
-        Right(v)
-      } catch {
-        case m: Malformed    => Left(SnapError.InvalidJson(s"$source: ${m.reason}"))
-        case d: DuplicateKey => Left(SnapError.DuplicateJsonKey(d.key))
+    def isWs(c: Char): Boolean = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+    def skipWs(): Unit =
+      while (pos < n && isWs(s.charAt(pos))) pos += 1
+
+    def scanString(): Boolean =
+      if (pos >= n || s.charAt(pos) != '"') false
+      else {
+        pos += 1
+        var closed = false
+        var failed = false
+        while (!closed && !failed && pos < n) {
+          val c = s.charAt(pos)
+          if (c == '"') {
+            pos += 1
+            closed = true
+          } else if (c == '\\') {
+            if (pos + 1 >= n) failed = true
+            else if (s.charAt(pos + 1) == 'u') {
+              if (pos + 6 > n) failed = true
+              else pos += 6
+            } else pos += 2
+          } else pos += 1
+        }
+        closed
       }
 
-    private def fail(reason: String): Nothing = throw new Malformed(reason)
+    def scanExponent(): Boolean =
+      if (pos < n && (s.charAt(pos) == 'e' || s.charAt(pos) == 'E')) {
+        pos += 1
+        if (pos < n && (s.charAt(pos) == '+' || s.charAt(pos) == '-')) pos += 1
+        var digits = 0
+        while (pos < n && s.charAt(pos).isDigit) {
+          pos += 1
+          digits += 1
+        }
+        digits > 0
+      } else true
 
-    private def peek: Char =
-      if (pos < input.length) input.charAt(pos) else fail("unexpected end of input")
+    def scanNumber(): Boolean = {
+      if (pos < n && s.charAt(pos) == '-') pos += 1
+      var digits = 0
+      while (pos < n && s.charAt(pos).isDigit) {
+        pos += 1
+        digits += 1
+      }
+      if (digits == 0) false
+      else if (pos < n && s.charAt(pos) == '.') {
+        pos += 1
+        var fractionDigits = 0
+        while (pos < n && s.charAt(pos).isDigit) {
+          pos += 1
+          fractionDigits += 1
+        }
+        fractionDigits > 0 && scanExponent()
+      } else scanExponent()
+    }
 
-    private def peekOpt: Option[Char] =
-      if (pos < input.length) Some(input.charAt(pos)) else None
+    def scanLiteral(word: String): Boolean =
+      if (pos + word.length <= n && s.regionMatches(pos, word, 0, word.length)) {
+        pos += word.length
+        true
+      } else false
 
-    private def advance(): Char = {
-      val c = peek
+    def scanObject(): Boolean = {
       pos += 1
-      c
-    }
-
-    private def skipWs(): Unit =
-      while (pos < input.length) {
-        val c = input.charAt(pos)
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') pos += 1
-        else return
-      }
-
-    private def expect(c: Char): Unit =
-      if (pos >= input.length || input.charAt(pos) != c)
-        fail(s"expected '$c' at offset $pos")
-      else pos += 1
-
-    private def parseValue(): Value =
-      peek match {
-        case '{'                        => parseObject()
-        case '['                        => parseArray()
-        case '"'                        => JStr(parseString())
-        case 't'                        => parseLiteral("true", JBool(true))
-        case 'f'                        => parseLiteral("false", JBool(false))
-        case 'n'                        => parseLiteral("null", JNull)
-        case c if c == '-' || c.isDigit => parseNumber()
-        case c                          => fail(s"unexpected character '$c' at offset $pos")
-      }
-
-    private def parseLiteral(text: String, value: Value): Value = {
-      if (input.regionMatches(pos, text, 0, text.length)) {
-        pos += text.length
-        value
-      } else fail(s"invalid literal at offset $pos")
-    }
-
-    private def parseObject(): Value = {
-      expect('{')
       skipWs()
-      val entries = Vector.newBuilder[(String, Value)]
-      val seen = scala.collection.mutable.HashSet.empty[String]
-      if (peekOpt.contains('}')) {
+      if (pos < n && s.charAt(pos) == '}') {
         pos += 1
-        return JObj(entries.result())
-      }
-      var continue = true
-      while (continue) {
-        skipWs()
-        if (!peekOpt.contains('"')) fail(s"expected object key at offset $pos")
-        val key = parseString()
-        if (!seen.add(key)) throw DuplicateKey(key)
-        skipWs()
-        expect(':')
-        skipWs()
-        val value = parseValue()
-        entries += ((key, value))
-        skipWs()
-        peekOpt match {
-          case Some(',') => pos += 1
-          case Some('}') => pos += 1; continue = false
-          case _         => fail(s"expected ',' or '}' at offset $pos")
+        true
+      } else {
+        var ok = true
+        var done = false
+        while (ok && !done) {
+          skipWs()
+          if (!scanString()) ok = false
+          else {
+            skipWs()
+            if (pos >= n || s.charAt(pos) != ':') ok = false
+            else {
+              pos += 1
+              if (!scanValue()) ok = false
+              else {
+                skipWs()
+                if (pos >= n) ok = false
+                else
+                  s.charAt(pos) match {
+                    case ',' => pos += 1
+                    case '}' =>
+                      pos += 1
+                      done = true
+                    case _ => ok = false
+                  }
+              }
+            }
+          }
         }
+        ok && done
       }
-      JObj(entries.result())
     }
 
-    private final case class DuplicateKey(key: String) extends RuntimeException
-
-    private def parseArray(): Value = {
-      expect('[')
+    def scanArray(): Boolean = {
+      pos += 1
       skipWs()
-      val items = Vector.newBuilder[Value]
-      if (peekOpt.contains(']')) {
+      if (pos < n && s.charAt(pos) == ']') {
         pos += 1
-        return JArr(items.result())
-      }
-      var continue = true
-      while (continue) {
-        skipWs()
-        items += parseValue()
-        skipWs()
-        peekOpt match {
-          case Some(',') => pos += 1
-          case Some(']') => pos += 1; continue = false
-          case _         => fail(s"expected ',' or ']' at offset $pos")
+        true
+      } else {
+        var ok = true
+        var done = false
+        while (ok && !done) {
+          if (!scanValue()) ok = false
+          else {
+            skipWs()
+            if (pos >= n) ok = false
+            else
+              s.charAt(pos) match {
+                case ',' => pos += 1
+                case ']' =>
+                  pos += 1
+                  done = true
+                case _ => ok = false
+              }
+          }
         }
+        ok && done
       }
-      JArr(items.result())
     }
 
-    private def parseString(): String = {
-      expect('"')
-      val sb = new StringBuilder
-      var done = false
-      while (!done) {
-        if (pos >= input.length) fail("unterminated string")
-        val c = input.charAt(pos)
-        pos += 1
-        if (c == '"') done = true
-        else if (c == '\\') {
-          if (pos >= input.length) fail("unterminated escape")
-          val esc = input.charAt(pos)
-          pos += 1
-          esc match {
-            case '"'  => sb.append('"')
-            case '\\' => sb.append('\\')
-            case '/'  => sb.append('/')
-            case 'b'  => sb.append('\b')
-            case 'f'  => sb.append('\f')
-            case 'n'  => sb.append('\n')
-            case 'r'  => sb.append('\r')
-            case 't'  => sb.append('\t')
-            case 'u' =>
-              if (pos + 4 > input.length) fail("truncated \\u escape")
-              val hex = input.substring(pos, pos + 4)
-              if (
-                !hex.forall(h =>
-                  (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F')
-                )
-              )
-                fail(s"invalid \\u escape at offset $pos")
-              sb.append(Integer.parseInt(hex, 16).toChar)
-              pos += 4
-            case other => fail(s"invalid escape '\\$other' at offset ${pos - 1}")
-          }
-        } else if (c < 0x20) {
-          fail(s"unescaped control character in string at offset ${pos - 1}")
-        } else {
-          sb.append(c)
+    def scanValue(): Boolean = {
+      skipWs()
+      if (pos >= n) false
+      else
+        s.charAt(pos) match {
+          case '{'                                     => scanObject()
+          case '['                                     => scanArray()
+          case '"'                                     => scanString()
+          case 't'                                     => scanLiteral("true")
+          case 'f'                                     => scanLiteral("false")
+          case 'n'                                     => scanLiteral("null")
+          case c if c == '-' || (c >= '0' && c <= '9') => scanNumber()
+          case _                                       => false
         }
-      }
-      sb.result()
     }
 
-    private def parseNumber(): Value = {
-      val start = pos
-      if (peekOpt.contains('-')) pos += 1
-      // integer part: 0 or [1-9][0-9]*
-      peekOpt match {
-        case Some('0') =>
-          pos += 1
-          peekOpt match {
-            case Some(d) if d.isDigit => fail(s"invalid number with leading zero at offset $start")
-            case _                    => ()
-          }
-        case Some(d) if d.isDigit =>
-          while (peekOpt.exists(_.isDigit)) pos += 1
-        case _ => fail(s"invalid number at offset $start")
-      }
-      // fraction
-      if (peekOpt.contains('.')) {
-        pos += 1
-        if (!peekOpt.exists(_.isDigit)) fail(s"invalid number fraction at offset $start")
-        while (peekOpt.exists(_.isDigit)) pos += 1
-      }
-      // exponent
-      if (peekOpt.exists(c => c == 'e' || c == 'E')) {
-        pos += 1
-        if (peekOpt.exists(c => c == '+' || c == '-')) pos += 1
-        if (!peekOpt.exists(_.isDigit)) fail(s"invalid number exponent at offset $start")
-        while (peekOpt.exists(_.isDigit)) pos += 1
-      }
-      JNum(input.substring(start, pos))
-    }
+    skipWs()
+    if (scanValue()) Some(pos) else None
   }
+
+  // ---------------------------------------------------------------------------
+  // Typed extraction helpers for the codec layer
+  // ---------------------------------------------------------------------------
+
+  def asObject(json: Value, what: String): Either[SnapError, ZJson.Obj] =
+    json match {
+      case o: ZJson.Obj => Right(o)
+      case _            => Left(SnapError.InvalidJson(s"$what: expected object"))
+    }
+
+  def asArray(json: Value, what: String): Either[SnapError, ZJson.Arr] =
+    json match {
+      case a: ZJson.Arr => Right(a)
+      case _            => Left(SnapError.InvalidJson(s"$what: expected array"))
+    }
+
+  def asString(json: Value, what: String): Either[SnapError, String] =
+    json match {
+      case ZJson.Str(s) => Right(s)
+      case _            => Left(SnapError.InvalidJson(s"$what: expected string"))
+    }
+
+  def asBoolean(json: Value, what: String): Either[SnapError, Boolean] =
+    json match {
+      case ZJson.Bool(b) => Right(b)
+      case _             => Left(SnapError.InvalidJson(s"$what: expected boolean"))
+    }
+
+  def field(obj: ZJson.Obj, name: String, what: String): Either[SnapError, Value] =
+    optionalField(obj, name) match {
+      case Some(v) => Right(v)
+      case None    => Left(SnapError.InvalidJson(s"$what: missing field '$name'"))
+    }
+
+  def optionalField(obj: ZJson.Obj, name: String): Option[Value] =
+    obj.fields.collectFirst { case (k, v) if k == name => v }
+
+  /** Distinct unknown keys in first-seen order. */
+  def unknownFields(obj: ZJson.Obj, allowed: Set[String]): Vector[String] =
+    obj.fields.map(_._1).filterNot(allowed.contains).toVector.distinct
+
+  /** Extract a JSON number as a `BigDecimal` without applying positivity or range rules.
+    *
+    * Positive-safe-integer validation is a domain concern performed when constructing
+    * revisions/counts (`Model.positiveSafeInteger`), not at the JSON boundary — the layer only
+    * reports type mismatches.
+    */
+  def asNumber(json: Value, what: String): Either[SnapError, JBigDecimal] =
+    json match {
+      case ZJson.Num(n) => Right(n)
+      case _            => Left(SnapError.InvalidJson(s"$what: expected number"))
+    }
 
   // ---------------------------------------------------------------------------
   // Writing (Node JSON.stringify(value, null, 2) compatible)
   // ---------------------------------------------------------------------------
 
   /** Render with two-space indentation, Node-style, plus a trailing LF. */
-  def renderPretty(v: Value): String = {
+  def writeCanonical(json: Value): String = {
     val sb = new StringBuilder
-    writeValue(sb, v, 0)
+    writeValue(sb, json, 0)
     sb.append('\n')
     sb.result()
   }
 
   private def pad(sb: StringBuilder, indent: Int): Unit = {
     var i = 0
-    while (i < indent) { sb.append("  "); i += 1 }
+    while (i < indent) {
+      sb.append("  ")
+      i += 1
+    }
   }
 
-  private def writeValue(sb: StringBuilder, v: Value, indent: Int): Unit = v match {
-    case JNull     => sb.append("null")
-    case JBool(b)  => sb.append(b.toString)
-    case JNum(raw) => sb.append(raw)
-    case JStr(s)   => writeString(sb, s)
-    case JArr(items) =>
-      if (items.isEmpty) sb.append("[]")
-      else {
-        sb.append("[\n")
-        var first = true
-        for (item <- items) {
-          if (!first) sb.append(",\n")
-          first = false
-          pad(sb, indent + 1)
-          writeValue(sb, item, indent + 1)
+  private def writeValue(sb: StringBuilder, json: Value, indent: Int): Unit =
+    json match {
+      case ZJson.Null    => sb.append("null")
+      case ZJson.Bool(b) => sb.append(if (b) "true" else "false")
+      case ZJson.Num(n)  => writeNumber(sb, n)
+      case ZJson.Str(s)  => writeString(sb, s)
+      case ZJson.Arr(items) =>
+        if (items.isEmpty) sb.append("[]")
+        else {
+          sb.append("[\n")
+          var i = 0
+          while (i < items.length) {
+            pad(sb, indent + 1)
+            writeValue(sb, items(i), indent + 1)
+            if (i < items.length - 1) sb.append(',')
+            sb.append('\n')
+            i += 1
+          }
+          pad(sb, indent)
+          sb.append(']')
         }
-        sb.append('\n')
-        pad(sb, indent)
-        sb.append(']')
-      }
-    case JObj(entries) =>
-      if (entries.isEmpty) sb.append("{}")
-      else {
-        sb.append("{\n")
-        var first = true
-        for ((k, value) <- entries) {
-          if (!first) sb.append(",\n")
-          first = false
-          pad(sb, indent + 1)
-          writeString(sb, k)
-          sb.append(": ")
-          writeValue(sb, value, indent + 1)
+      case ZJson.Obj(fields) =>
+        if (fields.isEmpty) sb.append("{}")
+        else {
+          sb.append("{\n")
+          var i = 0
+          while (i < fields.length) {
+            val (key, value) = fields(i)
+            pad(sb, indent + 1)
+            writeString(sb, key)
+            sb.append(": ")
+            writeValue(sb, value, indent + 1)
+            if (i < fields.length - 1) sb.append(',')
+            sb.append('\n')
+            i += 1
+          }
+          pad(sb, indent)
+          sb.append('}')
         }
-        sb.append('\n')
-        pad(sb, indent)
-        sb.append('}')
-      }
-  }
+    }
+
+  private def writeNumber(sb: StringBuilder, n: JBigDecimal): Unit =
+    if (n.signum() == 0) sb.append("0")
+    else {
+      val stripped = n.stripTrailingZeros()
+      if (stripped.scale() <= 0) sb.append(stripped.toBigIntegerExact.toString)
+      else sb.append(stripped.toPlainString)
+    }
 
   /** JSON string escaping compatible with JSON.stringify: named escapes for \b \f \n \r \t, \" and
-    * \\, \u00xx for other control characters.
+    * \\, \u00xx for other control characters, and escaped lone surrogates.
     */
   private def writeString(sb: StringBuilder, s: String): Unit = {
     sb.append('"')
@@ -326,8 +402,17 @@ object Json {
         case '\r' => sb.append("\\r")
         case '\t' => sb.append("\\t")
         case _ if c < 0x20 =>
-          sb.append("\\u")
-          sb.append(f"${c.toInt}%04x")
+          sb.append(f"\\u${c.toInt}%04x")
+        case _ if Character.isHighSurrogate(c) =>
+          if (i + 1 < s.length && Character.isLowSurrogate(s.charAt(i + 1))) {
+            sb.append(c)
+            sb.append(s.charAt(i + 1))
+            i += 1
+          } else {
+            sb.append(f"\\u${c.toInt}%04x")
+          }
+        case _ if Character.isLowSurrogate(c) =>
+          sb.append(f"\\u${c.toInt}%04x")
         case _ => sb.append(c)
       }
       i += 1

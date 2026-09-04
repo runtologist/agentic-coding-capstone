@@ -1,5 +1,6 @@
 package snap
 
+import java.math.{BigDecimal => JBigDecimal}
 import java.nio.ByteBuffer
 import java.nio.charset.{CharacterCodingException, CodingErrorAction, StandardCharsets}
 import java.util.Base64
@@ -13,6 +14,21 @@ object Model {
 
   /** JavaScript's maximum safe integer (SPEC §3.1). */
   val MaxSafeInteger: Long = 9007199254740991L
+
+  /** Validate that a decoded JSON number is a positive safe integer (1..=MaxSafeInteger).
+    *
+    * This is a domain rule applied at version/revision/count construction time, not a JSON parsing
+    * concern: fractional values, zero, negative values, and values above the JS max safe integer
+    * are all rejected. The JSON layer only extracts raw numbers.
+    */
+  def positiveSafeInteger(bd: JBigDecimal, context: String): Either[SnapError, Long] = {
+    val stripped = bd.stripTrailingZeros()
+    if (bd.signum() < 1 || stripped.scale() > 0)
+      Left(SnapError.NotPositiveSafeInteger(context))
+    else if (stripped.compareTo(JBigDecimal.valueOf(MaxSafeInteger)) > 0)
+      Left(SnapError.NotPositiveSafeInteger(context))
+    else Right(stripped.toBigIntegerExact.longValueExact())
+  }
 
   /** Maximum UTF-8 byte length of a user-supplied commit message (SPEC §4.2/§7.5). */
   val MaxCommitMessageBytes: Int = 4096
@@ -80,6 +96,31 @@ object Model {
       else if (s.indexOf('@') == 0 || s.indexOf('@') == s.length - 1)
         Left(SnapError.InvalidContributorId("must have text on both sides of '@'"))
       else Right(ContributorId(s))
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Ports (SPEC §7.9)
+  // ---------------------------------------------------------------------------
+
+  /** A validated serve port. `0` asks the OS to choose a port. */
+  opaque type Port <: Int = Int
+
+  object Port {
+    val default: Port = 8765
+
+    /** All-digit input in 0..=65535 with no leading zeros (except literal "0"). */
+    def parse(raw: String): Either[SnapError, Port] = {
+      if (raw.isEmpty || !raw.forall(c => c >= '0' && c <= '9'))
+        Left(SnapError.InvalidPort(raw))
+      else if (raw.length > 1 && raw.charAt(0) == '0')
+        Left(SnapError.InvalidPort(raw))
+      else if (raw.length > 5)
+        Left(SnapError.InvalidPort(raw))
+      else {
+        val n = raw.toInt
+        if (n > 65535) Left(SnapError.InvalidPort(raw)) else Right(n)
+      }
     }
   }
 
@@ -182,8 +223,13 @@ object Model {
       }
     }
 
+    private def renderPairs(pairs: Vector[(String, Long)]): String =
+      if (pairs.isEmpty) "()"
+      else pairs.map { case (id, r) => s"$id->$r" }.mkString("(", ",", ")")
+
     /** Parse the repository-JSON form: ordered [id, revision] pairs. Enforces valid IDs, positive
-      * safe revisions, unique canonically-sorted components.
+      * safe revisions (validated here at the JSON parse site), unique canonically-sorted
+      * components.
       */
     def fromPairs(pairs: Vector[(String, Long)], what: String): Either[SnapError, Version] = {
       val comps = Vector.newBuilder[(ContributorId, Long)]
@@ -194,21 +240,30 @@ object Model {
         val (rawId, rev) = pairs(i)
         ContributorId.parse(rawId) match {
           case Left(err) =>
-            failure = Some(SnapError.RepositoryInvalid(s"$what has ${err.detail}"))
+            failure = Some(err)
           case Right(id) =>
             if (rev < 1L || rev > MaxSafeInteger)
               failure = Some(
-                SnapError.RepositoryInvalid(s"$what revision is not a positive safe integer")
+                SnapError.NotPositiveSafeInteger(s"$what revision")
               )
             else {
               prevId.foreach { p =>
                 val cmp = utf8Compare(p.value, id.value)
                 if (cmp == 0)
                   failure = Some(
-                    SnapError.RepositoryInvalid(s"$what has duplicate contributor ${id.value}")
+                    SnapError.InvalidVersion(s"$what has duplicate contributor ${id.value}")
                   )
                 else if (cmp > 0)
-                  failure = Some(SnapError.RepositoryInvalid(s"$what is not in canonical order"))
+                  failure = Some(
+                    if (what == "frontier")
+                      SnapError.NonCanonicalFrontier(
+                        renderPairs(pairs),
+                        renderPairs(
+                          pairs.sortWith((x, y) => utf8Compare(x._1, y._1) < 0)
+                        )
+                      )
+                    else SnapError.InvalidVersion(s"$what is not in canonical order")
+                  )
               }
               prevId = Some(id)
               comps += ((id, rev))
@@ -253,7 +308,13 @@ object Model {
       else CausalOrder.Concurrent
     }
 
-    /** SPEC §3.3 componentwise join: max of every component. */
+    /** SPEC §3.3 componentwise join: max of every component.
+      *
+      * Total over valid versions: the componentwise maximum over the union of two sorted,
+      * unique-ID, positive-revision vectors is itself a valid version, so `join` cannot fail and
+      * returns `Version` directly rather than `Either`. Invalid versions never reach `join` because
+      * parsing/validation rejects them at the boundary.
+      */
     def join(a: Version, b: Version): Version =
       Version(
         unionIds(a, b)
@@ -367,7 +428,8 @@ object Model {
     */
   def applyEdit(
       baseTokens: Vector[String],
-      edit: Vector[EditOp]
+      edit: Vector[EditOp],
+      path: String = ""
   ): Either[SnapError, Vector[String]] = {
     @scala.annotation.tailrec
     def loop(
@@ -377,19 +439,19 @@ object Model {
     ): Either[SnapError, Vector[String]] = ops match {
       case Nil =>
         if (i < baseTokens.length)
-          Left(SnapError.RepositoryInvalid("edit script does not consume old content"))
+          Left(SnapError.EditNotConsuming(path))
         else if (!isCanonicalTokenSeq(acc))
           Left(
-            SnapError.RepositoryInvalid("edit script result is not a canonical token sequence")
+            SnapError.NonCanonicalTokens(path)
           )
         else Right(acc)
       case EditOp.Retain(n) :: rest =>
         if (i + n > baseTokens.length)
-          Left(SnapError.RepositoryInvalid("edit script consumes beyond old content"))
+          Left(SnapError.EditOverconsumes(path))
         else loop(rest, i + n.toInt, acc ++ baseTokens.slice(i, i + n.toInt))
       case EditOp.Delete(n) :: rest =>
         if (i + n > baseTokens.length)
-          Left(SnapError.RepositoryInvalid("edit script consumes beyond old content"))
+          Left(SnapError.EditOverconsumes(path))
         else loop(rest, i + n.toInt, acc)
       case EditOp.Insert(tokens) :: rest =>
         loop(rest, i, acc ++ tokens)
@@ -415,17 +477,19 @@ object Model {
   // ---------------------------------------------------------------------------
 
   def validatePath(p: String): Either[SnapError, Unit] = {
-    if (p.isEmpty) Left(SnapError.RepositoryInvalid("path is invalid: empty path"))
-    else if (p.indexOf('\\') >= 0) Left(SnapError.RepositoryInvalid(s"path is invalid: $p"))
+    if (p.isEmpty) Left(SnapError.InvalidRepoPath("", "empty path"))
+    else if (p.indexOf('\\') >= 0)
+      Left(SnapError.InvalidRepoPath(p, "contains a backslash"))
     else if (p.exists(c => c < 0x20 || c == 0x7f))
-      Left(SnapError.RepositoryInvalid(s"path is invalid: $p"))
+      Left(SnapError.InvalidRepoPath(p, "contains a control character"))
     else {
       val segments = p.split("/", -1)
-      if (segments.exists(_.isEmpty)) Left(SnapError.RepositoryInvalid(s"path is invalid: $p"))
+      if (segments.exists(_.isEmpty))
+        Left(SnapError.InvalidRepoPath(p, "contains an empty segment"))
       else if (segments.exists(s => s == "." || s == ".."))
-        Left(SnapError.RepositoryInvalid(s"path is invalid: $p"))
+        Left(SnapError.InvalidRepoPath(p, "contains a dot segment"))
       else if (segments.head == ".snap")
-        Left(SnapError.RepositoryInvalid(s"path is invalid: $p"))
+        Left(SnapError.InvalidRepoPath(p, "first segment is .snap"))
       else Right(())
     }
   }
@@ -443,9 +507,9 @@ object Model {
 
   /** Repository-level message validation: nonempty, only tab/LF among ASCII controls. */
   def validateStoredMessage(m: String): Either[SnapError, Unit] = {
-    if (m.isEmpty) Left(SnapError.RepositoryInvalid("patch message is empty"))
+    if (m.isEmpty) Left(SnapError.EmptyField("patch", "message"))
     else if (hasForbiddenMessageChar(m))
-      Left(SnapError.RepositoryInvalid("patch message contains a forbidden control character"))
+      Left(SnapError.InvalidMessage("contains a forbidden control character"))
     else Right(())
   }
 
@@ -468,19 +532,19 @@ object Model {
   private val Base64Shape =
     "^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{4}|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{2}==)?$".r
 
-  def decodeCanonicalBase64(s: String): Either[SnapError, Array[Byte]] = {
+  def decodeCanonicalBase64(s: String, path: String = ""): Either[SnapError, Array[Byte]] = {
     if (Base64Shape.findFirstIn(s).isEmpty)
-      Left(SnapError.RepositoryInvalid("content is not canonical base64"))
+      Left(SnapError.NonCanonicalBase64(path))
     else {
       val decoded =
         try Some(Base64.getDecoder.decode(s))
         catch { case _: IllegalArgumentException => None }
       decoded match {
-        case None        => Left(SnapError.RepositoryInvalid("content is not canonical base64"))
+        case None        => Left(SnapError.NonCanonicalBase64(path))
         case Some(bytes) =>
           // Round-trip catches non-canonical trailing bits.
           if (Base64.getEncoder.encodeToString(bytes) != s)
-            Left(SnapError.RepositoryInvalid("content is not canonical base64"))
+            Left(SnapError.NonCanonicalBase64(path))
           else Right(bytes)
       }
     }
@@ -554,4 +618,29 @@ object Model {
     def patchAt(id: ContributorId, revision: Long): Option[Patch] =
       patches.find(p => p.author == id && p.revision == revision)
   }
+}
+
+/** Whole-file conflict resolution recorded during canonical replay (SPEC §6.4). Rendered as
+  * `auto-resolved <path>: <reason>`; the CLI prefixes `warning: ` on stderr.
+  */
+enum ReplayWarning(val path: String, val reason: String) {
+  case DeleteWins(p: String) extends ReplayWarning(p, "delete-wins")
+  case LaterCreateWins(p: String) extends ReplayWarning(p, "later-create-wins")
+  case LaterPutWins(p: String) extends ReplayWarning(p, "later-put-wins")
+  case NamespaceWins(p: String) extends ReplayWarning(p, "namespace-wins")
+  case PutWins(p: String) extends ReplayWarning(p, "put-wins")
+
+  def detail: String = s"auto-resolved $path: $reason"
+}
+
+object ReplayWarning {
+
+  /** SPEC §6.4: replay returns unique warning pairs sorted by path, then reason. */
+  val byPathThenReason: Ordering[ReplayWarning] =
+    new Ordering[ReplayWarning] {
+      def compare(a: ReplayWarning, b: ReplayWarning): Int = {
+        val c = Model.utf8Compare(a.path, b.path)
+        if (c != 0) c else a.reason.compareTo(b.reason)
+      }
+    }
 }
