@@ -30,7 +30,8 @@ object Main extends ZIOAppDefault {
       home = getenv("HOME").map(Path.of(_)),
       snapColor = getenv("SNAP_COLOR"),
       noColorPresent = getenv("NO_COLOR").isDefined,
-      isTty = isTty
+      isTty = isTty,
+      snapDebug = getenv("SNAP_DEBUG").isDefined
     )
 
   /** Decide whether the JVM must be re-executed so filenames decode as UTF-8 (F-utf8).

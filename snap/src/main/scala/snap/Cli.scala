@@ -96,31 +96,32 @@ object Cli {
 
   /** `diff` / `diff <old> <new>` / `diff <old> <new> --repo <repository>`. Every grammar error in
     * diff renders the usage line instead of the generic grammar error (tests 14/24).
+    *
+    * H2: the scan is a @tailrec walk over the operand list; `--repo` consumes its value by
+    * advancing two positions, preserving the original single-pass, fail-fast behavior.
     */
   private def parseDiff(rest: Vector[String]): Either[SnapError, Command] = {
-    var operands = Vector.empty[String]
-    var repo: Option[String] = None
-    var i = 0
-    var failed = false
-    while (i < rest.length && !failed) {
-      val token = rest(i)
-      if (token == "--repo") {
-        // --repo only after both version operands, at most once, value required.
-        if (operands.length != 2 || repo.isDefined || i + 1 >= rest.length) failed = true
-        else {
-          repo = Some(rest(i + 1))
-          i += 1
+    @scala.annotation.tailrec
+    def scan(
+        i: Int,
+        operands: Vector[String],
+        repo: Option[String]
+    ): Either[SnapError, Command] =
+      if (i >= rest.length)
+        operands.length match {
+          case 0 if repo.isEmpty => Right(Command.Diff(None, None, None))
+          case 2                 => Right(Command.Diff(Some(operands(0)), Some(operands(1)), repo))
+          case _                 => diffUsage
         }
-      } else if (isOption(token)) failed = true
-      else operands = operands :+ token
-      i += 1
-    }
-    if (failed) diffUsage
-    else
-      operands.length match {
-        case 0 if repo.isEmpty => Right(Command.Diff(None, None, None))
-        case 2                 => Right(Command.Diff(Some(operands(0)), Some(operands(1)), repo))
-        case _                 => diffUsage
+      else {
+        val token = rest(i)
+        if (token == "--repo") {
+          // --repo only after both version operands, at most once, value required.
+          if (operands.length != 2 || repo.isDefined || i + 1 >= rest.length) diffUsage
+          else scan(i + 2, operands, Some(rest(i + 1)))
+        } else if (isOption(token)) diffUsage
+        else scan(i + 1, operands :+ token, repo)
       }
+    scan(0, Vector.empty, None)
   }
 }

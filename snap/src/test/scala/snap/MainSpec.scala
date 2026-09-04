@@ -41,9 +41,10 @@ object MainSpec extends ZIOSpecDefault {
       home: Option[Path] = None,
       snapColor: Option[String] = None,
       noColorPresent: Boolean = true,
-      isTty: Boolean = false
+      isTty: Boolean = false,
+      snapDebug: Boolean = false
   ): Commands.CmdEnv =
-    Commands.CmdEnv(cwd, home, snapColor, noColorPresent, isTty)
+    Commands.CmdEnv(cwd, home, snapColor, noColorPresent, isTty, snapDebug)
 
   private def runCli(args: String*)(env: Commands.CmdEnv): UIO[(Int, String, String)] =
     for {
@@ -67,7 +68,8 @@ object MainSpec extends ZIOSpecDefault {
           env.home.contains(Path.of("/home/user")),
           env.snapColor.contains("always"),
           env.noColorPresent,
-          env.isTty
+          env.isTty,
+          !env.snapDebug
         )
       },
       test("treats missing HOME as None and absent NO_COLOR as false") {
@@ -76,13 +78,20 @@ object MainSpec extends ZIOSpecDefault {
           env.home.isEmpty,
           env.snapColor.isEmpty,
           !env.noColorPresent,
-          !env.isTty
+          !env.isTty,
+          !env.snapDebug
         )
       },
       test("NO_COLOR present with an empty string still counts as present (test 28)") {
         val env =
           Main.cmdEnv(k => if (k == "NO_COLOR") Some("") else None, Path.of("/tmp"), isTty = true)
         assertTrue(env.noColorPresent)
+      },
+      test("maps SNAP_DEBUG presence into the snapshot (E3-M2)") {
+        val on = Main
+          .cmdEnv(k => if (k == "SNAP_DEBUG") Some("") else None, Path.of("/tmp"), isTty = false)
+        val off = Main.cmdEnv(_ => None, Path.of("/tmp"), isTty = false)
+        assertTrue(on.snapDebug, !off.snapDebug)
       }
     ),
     suite("argument vector → exit/stream table")(

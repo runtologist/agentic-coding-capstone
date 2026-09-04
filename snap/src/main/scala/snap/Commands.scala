@@ -21,13 +21,17 @@ import java.nio.file.Path
   */
 object Commands {
 
-  /** Environment snapshot captured once at startup (CONTRACT §14). */
+  /** Environment snapshot captured once at startup (CONTRACT §14). `snapDebug` records whether
+    * `SNAP_DEBUG` was present at process start so defect traces never re-read the live environment
+    * (E3-M2/E2-F4).
+    */
   final case class CmdEnv(
       cwd: Path,
       home: Option[Path],
       snapColor: Option[String],
       noColorPresent: Boolean,
-      isTty: Boolean
+      isTty: Boolean,
+      snapDebug: Boolean
   )
 
   /** Output capability: the real process streams in production, in-memory buffers in tests. */
@@ -35,6 +39,7 @@ object Commands {
     def writeOut(text: String): UIO[Unit]
     def writeErr(text: String): UIO[Unit]
     def flushOut: UIO[Unit]
+    def flushErr: UIO[Unit]
   }
 
   object Output {
@@ -55,6 +60,7 @@ object Commands {
       def writeOut(text: String): UIO[Unit] = ZIO.succeed(out.print(text))
       def writeErr(text: String): UIO[Unit] = ZIO.succeed(err.print(text))
       def flushOut: UIO[Unit] = ZIO.succeed(out.flush())
+      def flushErr: UIO[Unit] = ZIO.succeed(err.flush())
     }
 
     /** In-memory capture used by unit tests. */
@@ -63,6 +69,7 @@ object Commands {
         def writeOut(text: String): UIO[Unit] = outRef.update(_ + text)
         def writeErr(text: String): UIO[Unit] = errRef.update(_ + text)
         def flushOut: UIO[Unit] = ZIO.unit
+        def flushErr: UIO[Unit] = ZIO.unit
       }
       def stdout: UIO[String] = outRef.get
       def stderr: UIO[String] = errRef.get
@@ -82,32 +89,36 @@ object Commands {
     Render.resolvePresentation(env.snapColor, env.noColorPresent, env.isTty, env.isTty) match {
       case Left(err) =>
         // The invalid-SNAP_COLOR error is rendered plain before any command execution.
-        out.writeErr(Render.errorLine(err, Render.Presentation.Plain)).as(1)
+        (out.writeErr(Render.errorLine(err, Render.Presentation.Plain)) *> out.flushErr).as(1)
       case Right((pOut, pErr)) =>
         Cli.parse(args) match {
-          case Left(err)                  => out.writeErr(Render.errorLine(err, pErr)).as(1)
+          case Left(err) => (out.writeErr(Render.errorLine(err, pErr)) *> out.flushErr).as(1)
           case Right(Command.Serve(port)) => serve(port, env, out, pErr)
-          case Right(command)             => finish(execute(command, env, pOut, pErr), out, pErr)
+          case Right(command) =>
+            finish(execute(command, env, pOut, pErr), env, out, pErr)
         }
     }
 
   private def finish(
       effect: IO[SnapError, (String, String)],
+      env: CmdEnv,
       out: Output,
       pErr: Render.Presentation
   ): UIO[Int] =
     effect.exit.flatMap {
       case Exit.Success((stdout, stderr)) =>
-        out.writeOut(stdout) *> out.writeErr(stderr) *> out.flushOut.as(0)
+        // stderr may carry merge warnings: flush both streams (E3-M1).
+        out.writeOut(stdout) *> out.writeErr(stderr) *> out.flushOut *> out.flushErr.as(0)
       case Exit.Failure(cause) =>
         cause.failureOrCause match {
-          case Left(err) => out.writeErr(Render.errorLine(err, pErr)).as(1)
+          case Left(err) => (out.writeErr(Render.errorLine(err, pErr)) *> out.flushErr).as(1)
           case Right(defect) =>
             val dbg =
-              if (java.lang.System.getenv("SNAP_DEBUG") != null)
+              if (env.snapDebug)
                 ZIO.succeed(java.lang.System.err.println(defect.prettyPrint))
               else ZIO.unit
-            dbg *> out.writeErr(Render.errorLine(SnapError.InternalError, pErr)).as(2)
+            (dbg *> out.writeErr(Render.errorLine(SnapError.InternalError, pErr)) *>
+              out.flushErr).as(2)
         }
     }
 
@@ -164,28 +175,23 @@ object Commands {
   ): Either[SnapError, Vector[Change]] = {
     val paths =
       (current.keySet ++ updated.keySet).toVector.sortWith((a, b) => Model.utf8Compare(a, b) < 0)
-    val builder = Vector.newBuilder[Change]
-    var failure: Option[SnapError] = None
-    val it = paths.iterator
-    while (it.hasNext && failure.isEmpty) {
-      val path = it.next()
-      Model.validatePath(path) match {
-        case Left(err) => failure = Some(err)
-        case Right(()) =>
-          (current.get(path), updated.get(path)) match {
-            case (Some(old), Some(bytes)) =>
-              if (!Model.bytesEqual(old, bytes)) builder += textOrPut(path, Some(old), bytes)
-            case (None, Some(bytes)) =>
-              builder += textOrPut(path, None, bytes)
-            case (Some(_), None) =>
-              builder += Change.Del(path)
-            case (None, None) => ()
-          }
-      }
-    }
-    failure match {
-      case Some(err) => Left(err)
-      case None      => Right(builder.result())
+    // H2: foldLeft over the sorted paths, short-circuiting on the first path validation error.
+    paths.foldLeft[Either[SnapError, Vector[Change]]](Right(Vector.empty)) {
+      case (acc @ Left(_), _) => acc
+      case (Right(changes), path) =>
+        Model.validatePath(path) match {
+          case Left(err) => Left(err)
+          case Right(()) =>
+            (current.get(path), updated.get(path)) match {
+              case (Some(old), Some(bytes)) =>
+                if (!Model.bytesEqual(old, bytes))
+                  Right(changes :+ textOrPut(path, Some(old), bytes))
+                else Right(changes)
+              case (None, Some(bytes)) => Right(changes :+ textOrPut(path, None, bytes))
+              case (Some(_), None)     => Right(changes :+ Change.Del(path))
+              case (None, None)        => Right(changes)
+            }
+        }
     }
   }
 
@@ -284,6 +290,35 @@ object Commands {
       entries = ordered.reverse.map(pt => Render.LogEntry(pt.result, pt.author.value, pt.message))
     } yield (Render.log(entries, p), "")
 
+  /** Commit core over an already-loaded repository (E1-S1: the revision increment goes through
+    * [[Model.nextRevision]], failing typed before anything is written). Package-visible so tests
+    * can drive overflow scenarios that cannot be represented as a valid repository file.
+    */
+  private[snap] def commitWithRepo(
+      root: Path,
+      repo: Repository,
+      contributor: ContributorId,
+      message: String,
+      p: Render.Presentation
+  ): IO[SnapError, (String, String)] =
+    for {
+      _ <- ZIO.fromEither(Model.validateCommitMessage(message))
+      working <- WorkingTree.scan(root)
+      current <- currentTree(repo)
+      _ <-
+        if (WorkingTree.isClean(current, working)) ZIO.fail(SnapError.WorkingTreeClean)
+        else ZIO.unit
+      changes <- ZIO.fromEither(buildChanges(current, working))
+      revision <- ZIO.fromEither(Model.nextRevision(repo.frontier.get(contributor)))
+      patch = Patch(contributor, revision, repo.frontier, message, changes)
+      _ <- ZIO.fromEither(Codec.validateChangesAgainstBase(patch, current))
+      newRepo = Repository(
+        Version.withComponent(repo.frontier, contributor, revision),
+        (repo.patches :+ patch).sortWith(patchLess)
+      )
+      _ <- RepoIo.writeRepositoryAtomic(root, newRepo)
+    } yield (Render.successLine(Render.SuccessLabel.Committed, patch.result.render, p), "")
+
   private def commit(
       message: String,
       env: CmdEnv,
@@ -293,22 +328,8 @@ object Commands {
       root <- discover(env.cwd)
       repo <- RepoIo.loadRepository(root)
       contributor <- requireContributor(root, env)
-      _ <- ZIO.fromEither(Model.validateCommitMessage(message))
-      working <- WorkingTree.scan(root)
-      current <- currentTree(repo)
-      _ <-
-        if (WorkingTree.isClean(current, working)) ZIO.fail(SnapError.WorkingTreeClean)
-        else ZIO.unit
-      changes <- ZIO.fromEither(buildChanges(current, working))
-      revision = repo.frontier.get(contributor) + 1L
-      patch = Patch(contributor, revision, repo.frontier, message, changes)
-      _ <- ZIO.fromEither(Codec.validateChangesAgainstBase(patch, current))
-      newRepo = Repository(
-        Version.withComponent(repo.frontier, contributor, revision),
-        (repo.patches :+ patch).sortWith(patchLess)
-      )
-      _ <- RepoIo.writeRepositoryAtomic(root, newRepo)
-    } yield (Render.successLine(Render.SuccessLabel.Committed, patch.result.render, p), "")
+      result <- commitWithRepo(root, repo, contributor, message, p)
+    } yield result
 
   private def diff(
       oldRaw: Option[String],
@@ -350,6 +371,36 @@ object Commands {
         ZIO.fail(SnapError.InvalidCommandOrArguments)
     }
 
+  /** Revert core after version/known-version/clean/contributor checks (E1-S1: revision increment
+    * via [[Model.nextRevision]]). Package-visible for overflow tests; check ordering that lives in
+    * [[revert]] stays unchanged (CONTRACT §13).
+    */
+  private[snap] def revertWithRepo(
+      root: Path,
+      repo: Repository,
+      target: Version,
+      contributor: ContributorId,
+      p: Render.Presentation
+  ): IO[SnapError, (String, String)] =
+    for {
+      targetTree <- ZIO.fromEither(Replay.materialize(repo.patches, target).map(_._1))
+      current <- currentTree(repo)
+      _ <-
+        if (Model.treeEqual(targetTree, current)) ZIO.fail(SnapError.TargetTreeAlreadyCurrent)
+        else ZIO.unit
+      changes <- ZIO.fromEither(buildChanges(current, targetTree))
+      revision <- ZIO.fromEither(Model.nextRevision(repo.frontier.get(contributor)))
+      patch = Patch(contributor, revision, repo.frontier, s"revert to ${target.render}", changes)
+      _ <- ZIO.fromEither(Codec.validateChangesAgainstBase(patch, current))
+      // Working files first, then repository metadata (SPEC §10).
+      _ <- WorkingTree.materialize(root, targetTree)
+      newRepo = Repository(
+        Version.withComponent(repo.frontier, contributor, revision),
+        (repo.patches :+ patch).sortWith(patchLess)
+      )
+      _ <- RepoIo.writeRepositoryAtomic(root, newRepo)
+    } yield (Render.successLine(Render.SuccessLabel.Reverted, patch.result.render, p), "")
+
   private def revert(
       versionRaw: String,
       env: CmdEnv,
@@ -367,22 +418,8 @@ object Commands {
         if (WorkingTree.isClean(current, working)) ZIO.unit
         else ZIO.fail(SnapError.WorkingTreeDirty)
       contributor <- requireContributor(root, env)
-      targetTree <- ZIO.fromEither(Replay.materialize(repo.patches, target).map(_._1))
-      _ <-
-        if (Model.treeEqual(targetTree, current)) ZIO.fail(SnapError.TargetTreeAlreadyCurrent)
-        else ZIO.unit
-      changes <- ZIO.fromEither(buildChanges(current, targetTree))
-      revision = repo.frontier.get(contributor) + 1L
-      patch = Patch(contributor, revision, repo.frontier, s"revert to ${target.render}", changes)
-      _ <- ZIO.fromEither(Codec.validateChangesAgainstBase(patch, current))
-      // Working files first, then repository metadata (SPEC §10).
-      _ <- WorkingTree.materialize(root, targetTree)
-      newRepo = Repository(
-        Version.withComponent(repo.frontier, contributor, revision),
-        (repo.patches :+ patch).sortWith(patchLess)
-      )
-      _ <- RepoIo.writeRepositoryAtomic(root, newRepo)
-    } yield (Render.successLine(Render.SuccessLabel.Reverted, patch.result.render, p), "")
+      result <- revertWithRepo(root, repo, target, contributor, p)
+    } yield result
 
   private def merge(
       remoteRef: String,
@@ -451,13 +488,15 @@ object Commands {
       .foldCauseZIO(
         cause =>
           cause.failureOrCause match {
-            case Left(err) => out.writeErr(Render.errorLine(err, pErr)).as(1)
+            case Left(err) =>
+              (out.writeErr(Render.errorLine(err, pErr)) *> out.flushErr).as(1)
             case Right(defect) =>
               val dbg =
-                if (java.lang.System.getenv("SNAP_DEBUG") != null)
+                if (env.snapDebug)
                   ZIO.succeed(java.lang.System.err.println(defect.prettyPrint))
                 else ZIO.unit
-              dbg *> out.writeErr(Render.errorLine(SnapError.InternalError, pErr)).as(2)
+              (dbg *> out.writeErr(Render.errorLine(SnapError.InternalError, pErr)) *>
+                out.flushErr).as(2)
           },
         _ => ZIO.succeed(0)
       )
