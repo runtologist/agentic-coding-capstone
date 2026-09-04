@@ -47,6 +47,18 @@ needed there, STOP and report.
 
 ---
 
+## What the JSON layer already enforces (J1 — do NOT re-check, but rely on)
+
+`Json.parseRepository` already rejects: malformed JSON, trailing content,
+duplicate object keys (any depth), unknown fields (repo/patch/change levels),
+non-integer or non-positive-safe-integer revisions/counts, edit ops without
+exactly one key, empty insert arrays, empty `changes` arrays, empty/invalid
+messages (`validateStoredMessage`), invalid paths (`validatePath`),
+non-canonical base64 (`decodeCanonicalBase64`), and per-token insert validity
++ insert-sequence canonicality (`NonCanonicalTokens`). Codec validates the
+decoded typed value: history shape, ordering, closure, and change-vs-base
+semantics.
+
 ## Part A — `Replay.scala`
 
 ### Public surface
@@ -317,12 +329,12 @@ Pin every row of the CONTRACT §7 table that is Codec-level:
 1. `sbt --client shutdown` (ignore failure), then
    `source scripts/env.sh && cd snap && sbt --client "compile; test; assembly; scalafmtCheckAll"`
    all green; then `sbt --client shutdown`.
-2. All pre-existing tests (Model, SnapError, Json, Cli, Render, Diff, Ot)
-   still pass — expect ≥ 253 + your new tests.
-3. Only the four owned files created/modified.
-4. Commit on `task/06-codec-replay`; push:
+2. All pre-existing tests (Model, SnapError, Json, Cli, Render, Diff, Ot —
+   253 today) still pass; add ≥65 new tests.
+3. Only the four owned files created.
+4. Commit on `task/06-codec-replay`, push:
    `git push -u origin task/06-codec-replay`. No Co-Authored-By trailers.
-5. Final report: files changed, test counts, gate tails, any SPEC ambiguity
-   you had to resolve (state your ruling), deviations with justification,
-   and notes for L4 (WorkingTree/RepoIo/Config) and L7 (Commands/Main)
-   on how to call Codec + Replay.
+5. Final report: files changed, test counts, gate tails, SPEC ambiguities you
+   resolved (state the ruling), deviations with justification, and integration
+   notes for L4 (WorkingTree/RepoIo/Config) and L7 (Commands/Main) on calling
+   Codec + Replay.
