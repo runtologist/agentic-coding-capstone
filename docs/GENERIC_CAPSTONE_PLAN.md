@@ -122,7 +122,9 @@ Operational rules:
    The one-writer-per-worktree rule is unchanged by background execution.
 8. Parallel gates from different worktrees each start their own
    `sbt --client` server; keep lane gates inside the lane and reserve
-   orchestrator-level `bg_run` for integration/final suites.
+   orchestrator-level `bg_run` for integration/final suites. Each lane shuts
+   down its own server when done; the parent shuts down any server it started
+   once integration finishes.
 
 ## 3. Parallel subagent strategy
 
@@ -136,6 +138,8 @@ Parallelism is only safe when modules have fixed interfaces.
 - Run the gate suite as a named background task (`bg_run`, `isAgent: false`)
   while continuing contract/scaffolding work; verify from the terminal
   notification, never by polling.
+- Shut down the sbt server (`sbt --client shutdown`) before handing off, and
+  again after any sbt config change (`build.sbt`, `project/plugins.sbt`).
 
 ### Phase B — Architecture proposal (sequential, one architect)
 
@@ -184,6 +188,11 @@ Orchestration:
 - Child lanes run their own gates **synchronously** (bash with timeouts). Do
   not rely on `bg_*` inside lane children: their lifetime ends with the task;
   background tasks belong to the orchestrator session.
+- Every lane that starts an `sbt --client` server must run
+  `sbt --client shutdown` after its final gate passes (and immediately after
+  any sbt config change), so finished worktrees do not leave idle sbt/JVM
+  processes behind. Add this as an explicit step in each packet's definition
+  of done.
 
 Ledger:
 
@@ -291,6 +300,10 @@ is written.
    closed only after both complete with recorded evidence.
 
 Gotchas learned:
+- Idle `sbt --client` servers keep running after a lane or worktree is done.
+  Require `sbt --client shutdown` at the end of every lane that ran sbt (and
+  after every sbt config change, so the server restarts cleanly on the next
+  build); otherwise parallel worktrees accumulate JVM processes.
 - Managed worktree lanes may lose their branch refs when the worktree is
   cleaned up; merge by commit hash if the branch is gone (commits remain
   reachable).
