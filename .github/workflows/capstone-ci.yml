@@ -13,7 +13,7 @@ jobs:
     outputs:
       projects: ${{ steps.find.outputs.projects }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Find Scala capstone projects (top-level dirs with build.sbt)
         id: find
         run: |
@@ -34,10 +34,10 @@ jobs:
       matrix:
         project: ${{ fromJson(needs.discover-projects.outputs.projects) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up JDK 25
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '25'
@@ -46,7 +46,7 @@ jobs:
         uses: sbt/setup-sbt@v1
 
       - name: Cache sbt/Coursier artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.ivy2/cache
@@ -58,13 +58,37 @@ jobs:
             ${{ runner.os }}-sbt-
 
       - name: Format check, unit tests, assembly
+        id: sbt
         working-directory: ${{ matrix.project }}
-        run: sbt -batch -Dsbt.ci=true "scalafmtCheckAll; test; assembly"
+        run: |
+          set -o pipefail
+          sbt -batch -Dsbt.ci=true "scalafmtCheckAll; test; assembly" 2>&1 \
+            | tee "${GITHUB_WORKSPACE}/sbt-${{ matrix.project }}.log"
+
+      - name: Summarize sbt unit test results
+        if: always()
+        run: |
+          LOG="${GITHUB_WORKSPACE}/sbt-${{ matrix.project }}.log"
+          summary=""
+          if [ -f "$LOG" ]; then
+            summary="$(grep -E '[0-9]+ tests passed' "$LOG" | tail -1 || true)"
+          fi
+          echo "SBT RESULT (${{ matrix.project }}): ${summary:-no summary line found}"
+          {
+            echo "### ${{ matrix.project }} — sbt unit tests"
+            echo ""
+            echo "- ${summary:-**no summary line found — check sbt log artifact**}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.sbt.outcome }}" = "success" ] && [ -z "$summary" ]; then
+            echo "::error::sbt step succeeded but no test summary line was found"
+            exit 1
+          fi
 
       - name: Check for vendored acceptance harness
         id: harness
         run: |
-          if [ -x "harness/${{ matrix.project }}/run_tests" ]; then
+          if [ -f "harness/${{ matrix.project }}/run_tests" ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
@@ -72,7 +96,7 @@ jobs:
 
       - name: Set up Node.js
         if: steps.harness.outputs.present == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
@@ -84,5 +108,55 @@ jobs:
         run: npm ci
 
       - name: Run generic acceptance test suite
+        id: harness-run
         if: steps.harness.outputs.present == 'true'
-        run: harness/${{ matrix.project }}/run_tests --lang scala --implementation-root "${GITHUB_WORKSPACE}/${{ matrix.project }}"
+        env:
+          NO_COLOR: "1"
+        run: |
+          set -o pipefail
+          bash "harness/${{ matrix.project }}/run_tests" --lang scala \
+            --implementation-root "${GITHUB_WORKSPACE}/${{ matrix.project }}" \
+            2>&1 | tee "${GITHUB_WORKSPACE}/harness-${{ matrix.project }}.log"
+
+      - name: Verify acceptance test results
+        if: always() && steps.harness.outputs.present == 'true'
+        run: |
+          LOG="${GITHUB_WORKSPACE}/harness-${{ matrix.project }}.log"
+          if [ ! -f "$LOG" ]; then
+            if [ "${{ steps.harness-run.outcome }}" = "skipped" ]; then
+              echo "harness step was skipped" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::harness log not found"
+            exit 1
+          fi
+          expected=$(ls "harness/${{ matrix.project }}/tests"/*.yaml "harness/${{ matrix.project }}/tests"/*.yml 2>/dev/null | wc -l | tr -d ' ')
+          summary="$(tail -5 "$LOG" | grep -E 'passed' | tail -1 || true)"
+          passed="$(echo "$summary" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || true)"
+          echo "HARNESS RESULT (${{ matrix.project }}): expected=${expected} passed=${passed:-?} summary='${summary:-missing}'"
+          {
+            echo "### ${{ matrix.project }} — acceptance harness"
+            echo ""
+            echo "- cases expected: ${expected}"
+            echo "- cases passed: ${passed:-?}"
+            echo "- summary line: \`${summary:-missing}\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          if echo "$summary" | grep -qE '^[0-9]+ failed'; then
+            echo "::error::Acceptance harness reported failures"
+            exit 1
+          fi
+          if [ -z "$passed" ] || [ "$passed" -lt "$expected" ]; then
+            echo "::error::Expected ${expected} passing acceptance cases, got '${passed:-none}'"
+            exit 1
+          fi
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: test-logs-${{ matrix.project }}
+          path: |
+            sbt-${{ matrix.project }}.log
+            harness-${{ matrix.project }}.log
+          if-no-files-found: warn
