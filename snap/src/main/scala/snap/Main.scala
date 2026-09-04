@@ -70,6 +70,12 @@ object Main extends ZIOAppDefault {
       jarPath
     ) ++ args
 
+  /** Environment overrides for the re-exec child (F-utf8): force a UTF-8 locale so the child JVM
+    * derives `sun.jnu.encoding=UTF-8`, and set the recursion guard. Pure, so unit-testable.
+    */
+  private[snap] def reexecEnv: Map[String, String] =
+    Map("LANG" -> "C.UTF-8", "LC_ALL" -> "C.UTF-8", "SNAP_JNU_REEXEC" -> "1")
+
   /** Guarded JVM re-exec for UTF-8 filename handling (F-utf8).
     *
     * If [[jnuNeedsReexec]] decides a relaunch is required, spawns the child with inherited IO
@@ -96,7 +102,11 @@ object Main extends ZIOAppDefault {
     val javaHome = java.lang.System.getProperty("java.home")
     val command = reexecCommand(javaHome, jarPath.get, args)
     try {
-      val child = new ProcessBuilder(command*).inheritIO().start()
+      val builder = new ProcessBuilder(command*)
+      builder.inheritIO()
+      val childEnv = builder.environment()
+      reexecEnv.foreach { case (k, v) => childEnv.put(k, v) }
+      val child = builder.start()
       // No-op TERM/INT handlers: the harness signals the whole process group, so the child
       // handles shutdown itself and the parent must survive to relay its exit code.
       val noop: sun.misc.SignalHandler = (_: sun.misc.Signal) => ()

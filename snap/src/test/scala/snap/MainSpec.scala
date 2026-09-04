@@ -201,6 +201,21 @@ object MainSpec extends ZIOSpecDefault {
           )
         )
       }
+    ),
+    suite("reexecEnv overrides (F-utf8)")(
+      test("forces UTF-8 locale and sets the recursion guard") {
+        val env = Main.reexecEnv
+        assertTrue(
+          env("LANG") == "C.UTF-8",
+          env("LC_ALL") == "C.UTF-8",
+          env("SNAP_JNU_REEXEC") == "1"
+        )
+      },
+      test("contains exactly the three required override keys") {
+        assertTrue(
+          Main.reexecEnv.keySet == Set("LANG", "LC_ALL", "SNAP_JNU_REEXEC")
+        )
+      }
     )
   )
 }
