@@ -138,9 +138,7 @@ object Main extends ZIOAppDefault {
           ZIO.attemptBlocking(attemptJnuReexec(args)).flatMap {
             case Some(childCode) => exit(ExitCode(childCode))
             case None =>
-              ZIO.attemptBlocking {
-                java.lang.System.err.print("snap: internal error\n")
-              } *> exit(ExitCode(2))
+              Console.printLineError("snap: internal error").orDie *> exit(ExitCode(2))
           }
         else exit(ExitCode(code))
     } yield ()
