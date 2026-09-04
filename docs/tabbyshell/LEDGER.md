@@ -41,12 +41,13 @@ One worktree lane per module, disjoint file ownership, no build-file edits,
 no behavior changes. Lane gates: `compile`, `test`, `scalafmtAll;
 scalafmtCheckAll`, then `sbt --client shutdown`.
 
-| Lane key | Owned test file(s) | Production file (testability-only edits allowed) | Status | Commit |
-|---|---|---|---|---|
-| `cov-executor` | `ExecutorSpec.scala` | `Executor.scala` | dispatched | — |
-| `cov-main` | `MainSpec.scala` (new) | `Main.scala` | dispatched | — |
-| `cov-external` | `ExternalSpec.scala` (new) | `External.scala` | dispatched | — |
-| `cov-specs` | `ParserSpec`, `JsonSpec`, `CsvSpec`, `RenderSpec`, `TabbyErrorSpec` | none | dispatched | — |
+| Lane key | Owned test file(s) | Production file (testability-only edits allowed) | Target | Status | Commit |
+|---|---|---|---|---|---|
+| `cov-executor` | `ExecutorSpec.scala` | `Executor.scala` | 39→80% | dispatched | — |
+| `cov-main` | `MainSpec.scala` (new) | `Main.scala` | 0→60%+ | dispatched | — |
+| `cov-external` | `ExternalSpec.scala` (new) | `External.scala` | 0→70%+ | dispatched | — |
+| `cov-parser` | `ParserSpec.scala` | `Parser.scala` | 68→85%+ | dispatched | — |
+| `cov-render-json-csv` | `RenderSpec`, `JsonSpec`, `CsvSpec`, `TabbyErrorSpec` | none | 80%+ each | dispatched | — |
 
 ### Rulings / parked items
 
