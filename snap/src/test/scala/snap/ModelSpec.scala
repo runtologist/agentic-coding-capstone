@@ -468,6 +468,95 @@ object ModelSpec extends ZIOSpecDefault {
           isProperAncestor("a/b", "a/b/c")
         )
       }
+    ),
+    suite("Port.parse")(
+      test("accepts 0, the default, and the max") {
+        assertTrue(
+          Port.parse("0").map(p => p: Int) == Right(0),
+          Port.parse("8765").map(p => p: Int) == Right(8765),
+          Port.parse("65535").map(p => p: Int) == Right(65535),
+          (Port.default: Int) == 8765
+        )
+      },
+      test("rejects out-of-range, negative, non-numeric, fractional, and leading-zero input") {
+        assertTrue(
+          Port.parse("65536").isLeft,
+          Port.parse("-1").isLeft,
+          Port.parse("abc").isLeft,
+          Port.parse("1.5").isLeft,
+          Port.parse("07").isLeft,
+          Port.parse("").isLeft,
+          Port.parse(" 80").isLeft,
+          Port.parse("123456").isLeft
+        )
+      },
+      test("invalid port errors echo the raw input (test 14 pins 65536)") {
+        assertTrue(
+          leftDetail(Port.parse("65536")).contains("invalid port: 65536"),
+          leftDetail(Port.parse("abc")).contains("invalid port: abc")
+        )
+      }
+    ),
+    suite("ReplayWarning")(
+      test("renders auto-resolved <path>: <reason> for all five winners") {
+        assertTrue(
+          (ReplayWarning.DeleteWins("f"): ReplayWarning).detail == "auto-resolved f: delete-wins",
+          (ReplayWarning.LaterCreateWins("p"): ReplayWarning).detail ==
+            "auto-resolved p: later-create-wins",
+          (ReplayWarning.LaterPutWins("p"): ReplayWarning).detail ==
+            "auto-resolved p: later-put-wins",
+          (ReplayWarning.NamespaceWins("a/b"): ReplayWarning).detail ==
+            "auto-resolved a/b: namespace-wins",
+          (ReplayWarning.PutWins("x"): ReplayWarning).detail == "auto-resolved x: put-wins"
+        )
+      },
+      test("byPathThenReason sorts by path (UTF-8) then reason (test 10 order)") {
+        val warnings = Vector(
+          ReplayWarning.PutWins("b"),
+          ReplayWarning.NamespaceWins("a"),
+          ReplayWarning.DeleteWins("a"),
+          ReplayWarning.DeleteWins("z")
+        )
+        val sorted = warnings.sorted(using ReplayWarning.byPathThenReason)
+        assertTrue(
+          sorted.map(w => (w.path, w.reason)) == Vector(
+            ("a", "delete-wins"),
+            ("a", "namespace-wins"),
+            ("b", "put-wins"),
+            ("z", "delete-wins")
+          )
+        )
+      }
+    ),
+    suite("positiveSafeInteger")(
+      test("accepts 1 and the JS max safe integer") {
+        assertTrue(
+          positiveSafeInteger(new java.math.BigDecimal("1"), "revision") == Right(1L),
+          positiveSafeInteger(new java.math.BigDecimal("9007199254740991"), "revision") ==
+            Right(9007199254740991L)
+        )
+      },
+      test("accepts integer-valued forms 1.0 and 1e2 (JS Number.isInteger semantics)") {
+        assertTrue(
+          positiveSafeInteger(new java.math.BigDecimal("1.0"), "revision") == Right(1L),
+          positiveSafeInteger(new java.math.BigDecimal("1e2"), "revision") == Right(100L)
+        )
+      },
+      test("rejects fractional, zero, negative, and over-max values (tests 23/25)") {
+        assertTrue(
+          positiveSafeInteger(new java.math.BigDecimal("1.5"), "revision").isLeft,
+          positiveSafeInteger(new java.math.BigDecimal("0"), "retain count").isLeft,
+          positiveSafeInteger(new java.math.BigDecimal("-1"), "revision").isLeft,
+          positiveSafeInteger(new java.math.BigDecimal("9007199254740992"), "revision").isLeft
+        )
+      },
+      test("rejection message carries context and ends with the pinned substring") {
+        val r = positiveSafeInteger(new java.math.BigDecimal("1.5"), "revision")
+        assertTrue(
+          leftDetail(r).contains("revision is not a positive safe integer"),
+          leftDetail(r).exists(_.endsWith("positive safe integer"))
+        )
+      }
     )
   )
 }
