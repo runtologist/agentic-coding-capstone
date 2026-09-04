@@ -1,92 +1,61 @@
-# Task F-cmd: Command-layer hygiene (wave 2 — after wave-1 merges)
+# Task F-cmd — Command-layer hygiene (E3-M1, E3-M2/E2-F4, E1-S1 wiring, H2 loops)
 
-**Lane:** F-cmd · **Branch:** `task/13-command-hygiene` (from `main` after wave-1 merges)
-**Worktree:** to be created at dispatch time
-**Owned files (modify ONLY these):**
+**Branch:** `task/13-command-hygiene` · **Worktree:** `/private/tmp/snap-fcmd` · **Base:** main @ 2b49646
+
+## Owned files (modify ONLY these)
 
 - `snap/src/main/scala/snap/Commands.scala`
+- `snap/src/main/scala/snap/Main.scala`
 - `snap/src/main/scala/snap/Cli.scala`
 - `snap/src/main/scala/snap/Render.scala`
 - `snap/src/test/scala/snap/CommandsSpec.scala`
+- `snap/src/test/scala/snap/MainSpec.scala`
 - `snap/src/test/scala/snap/CliSpec.scala`
 - `snap/src/test/scala/snap/RenderSpec.scala`
 
-**Do NOT touch:** Model.scala, Diff.scala, Json.scala, Codec.scala, Ot.scala, Replay.scala,
-SnapError.scala, WorkingTree.scala, RepoIo.scala, Config.scala, HttpServe.scala, HttpFetch.scala,
-Main.scala (unless a trivial CmdEnv field addition is required for SNAP_DEBUG — coordinate with
-the merged wave-1 Main.scala state), anything under `harness/`.
+Do NOT touch Model.scala, Json.scala, Codec.scala, Ot.scala, Replay.scala, Diff.scala,
+WorkingTree.scala, RepoIo.scala, Config.scala, HttpServe.scala, HttpFetch.scala, SnapError.scala,
+or anything under `harness/`. Other lanes already changed some of these and they are merged into your base.
 
-## Context
+## Findings to fix
 
-This is wave 2b of Phase F. Wave 1 (F-utf8, F-diff, F-io-http) and wave 2a (F-core: Model/Json/
-Codec/Ot/Replay typed-integers + loop refactor) have already merged into main.
-Branch from the current main HEAD at dispatch time. Read the merged state of all files before
-starting — especially Model.scala, which may expose new helpers (e.g. `nextRevision`) and a
-`PositiveSafeInteger` opaque type.
+### 1. E3-M1 (minor): stderr not explicitly flushed on failure paths
+`Commands.Output` exposes only `flushOut`. Error paths (`Commands.run` Left branch, `finish`
+failure branch, serve failure) write stderr but never flush it explicitly. Add `flushErr: UIO[Unit]`
+to `Output` (live: flush the stderr PrintStream; Captured: `ZIO.unit`), and call it after every
+`writeErr` on failure/warning paths so exit-time bytes are deterministic.
 
-## Findings to address
+### 2. E3-M2 / E2-F4 (minor): SNAP_DEBUG read live from the environment
+`Commands.scala` reads `java.lang.System.getenv("SNAP_DEBUG")` inside the defect handler (two sites).
+This violates the CmdEnv snapshot policy documented in Main.scala. Add `snapDebug: Boolean` to
+`Commands.CmdEnv`, populate it in `Main.cmdEnv` from `getenv("SNAP_DEBUG").isDefined`, update
+`MainSpec.cmdEnv` tests, and replace both live reads with `env.snapDebug` (thread `env` into `finish`
+and the serve failure path as needed).
 
-### E3-M1 — Flush stderr on error paths (minor)
-`Commands.finish` writes the error line to stderr but only calls `flushOut` on the success path.
-`Commands.serve` error path similarly. Add `flushErr` to the `Output` trait (and its
-implementations: `live` and `Captured`), and call it after every `writeErr` in error/warning
-exit paths (`finish`, `serve` failure branch). This is a robustness fix; behavior under the
-harness should not change (harness already passes), but it removes a theoretical race where
-stderr bytes are lost on abrupt exit.
+### 3. E1-S1 wiring (minor): revision overflow in commit/revert
+`Model.nextRevision(current: Long): Either[SnapError, Long]` now exists (added by the F-core lane).
+Replace the raw `frontier.get(contributor) + 1` arithmetic in `Commands.commit` (and any other
+revision-increment site in Commands.scala) with `Model.nextRevision`, propagating the typed error.
+Add CommandsSpec tests constructing a repository whose frontier is at `9007199254740991` for the
+contributor: `commit` must fail with the overflow message and exit 1, and must NOT write the repo.
 
-### E3-M2 / E2-F4 — SNAP_DEBUG via CmdEnv (nit → fix)
-`Commands.scala:107` and `:457` read `java.lang.System.getenv("SNAP_DEBUG")` live, bypassing the
-CmdEnv snapshot established in Main. Fix: add `snapDebug: Boolean` to `CmdEnv`, populate it in
-`Main.cmdEnv` from `getenv("SNAP_DEBUG").isDefined`, and replace the two live reads with
-`env.snapDebug`. This is a small, mechanical change.
+### 4. H2 (human review): idiomatic loop rewrites in owned files
+Rewrite the remaining `while` loops in Cli.scala (1 site), Commands.scala (1 site), and Render.scala
+(2 sites) using `@tailrec`, `foldLeft`, `zipWithIndex.foreach`, or equivalent — only where behavior
+and performance characteristics are preserved. All existing CliSpec/RenderSpec/CommandsSpec goldens
+must pass unchanged. If a rewrite hurts clarity/perf, keep the loop with a one-line justification.
 
-### E1-S1 wiring — Revision overflow guard in commit/revert (minor)
-The wave-2 F-core lane (merged before this one) adds `Model.nextRevision(current: Long):
-Either[SnapError, Long]` (or equivalent). Wire it into `Commands.commit` and `Commands.revert` so
-that when `frontier.get(contributor) + 1` would exceed 9007199254740991, the command fails with a
-typed SnapError (exit 1) instead of silently persisting an unloadable repository. Add CommandsSpec
-tests that construct a repository with frontier at max safe integer and assert the error.
+## Definition of done
 
-### E5-F4 — Exit-2 defect channel test (nit)
-Add a CommandsSpec test that forces a defect (e.g., `ZIO.dieMessage("boom")`) through
-`Commands.run` and asserts exit code 2 + stderr `snap: internal error\n`. This pins the
-exit-2 channel behavior.
+1. Red tests first for items 1–3 (as far as testable): capture failing output in your report.
+2. Full gate green in the worktree:
+   `source scripts/env.sh && cd snap && sbt --client "compile; test; assembly; scalafmtCheckAll" && sbt --client shutdown`
+3. Acceptance harness green from the worktree root:
+   `bash harness/snap/run_tests --lang scala --implementation-root $PWD/snap` (expect 28/28).
+4. Commit on `task/13-command-hygiene`, author `Snap dev <capstone-dev@local>`, no AI trailers; push to origin.
 
-### H2 (partial) — while-loops in Cli.scala, Commands.scala, Render.scala
-Rewrite remaining `while` loops in these three files to idiomatic Scala (foldLeft, @tailrec,
-zipWithIndex.foreach) where behavior is preserved. Currently: Cli.scala:105 (1 loop),
-Commands.scala:170 (1 loop), Render.scala:206,213 (2 loops). If a loop is performance-critical
-or the rewrite obscures clarity, keep it with a one-line justification comment.
+## Safety rules (strict)
 
-### E3-N1 — Remove guarded cast in Replay.scala
-(Only if Replay.scala is NOT owned by a wave-1 lane that already addressed it. Check merged
-state first. If already fixed, skip.)
-
-## TDD
-
-For each behavioral change (M1 flush, M2 CmdEnv, S1 overflow, F4 exit-2 test): write the failing
-test first, capture red, implement, capture green. For H2 loop rewrites: existing tests must
-remain green (behavior-preserving refactor).
-
-## Gates
-
-```bash
-source scripts/env.sh && cd snap
-sbt --client "compile; test; assembly; scalafmtCheckAll"
-sbt --client shutdown
-cd ..
-bash harness/snap/run_tests --lang scala --implementation-root "$PWD/snap"   # expect 28/28
-```
-
-## Safety rules
-
-- Work ONLY inside your assigned worktree. Never rm -rf/mv outside it.
-- No destructive git commands. NEVER touch `harness/`.
-- Git identity: `Snap dev <capstone-dev@local>`; no Co-Authored-By or AI trailers.
-- `sbt --client` only; `sbt --client shutdown` before finishing.
-
-## Finish
-
-Commit on `task/13-command-hygiene`, push to origin, then report (<400 words): lane id, status,
-branch, commit SHAs, files changed, tests added/total, gate evidence, findings addressed per ID,
-parked items, risks.
+- Work ONLY inside /private/tmp/snap-fcmd (scratch files under /tmp/snap-fcmd-scratch if needed).
+- No rm -rf / mv outside your worktree; no destructive git; no harness edits; no new dependencies.
+- Kill any process you start (e.g., `snap --serve`).
