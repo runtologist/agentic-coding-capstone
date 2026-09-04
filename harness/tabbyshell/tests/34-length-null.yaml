@@ -1,0 +1,11 @@
+name: "length of null is 0"
+script: |
+  cd .
+  cd .
+  # The previous `cd` returns Null; pipe it into length
+  cd . | length
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "0"

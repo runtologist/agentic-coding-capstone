@@ -1,0 +1,11 @@
+name: "date in the previous day window renders as 'yesterday'"
+now: 1700000000   # Tue Nov 14 2023 22:13:20 UTC
+setup:
+  - shell: "touch -d '2023-11-13T22:13:20Z' a.txt"
+script: |
+  ls | get modified
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "yesterday"

@@ -1,0 +1,19 @@
+name: "where filters CSV rows by string column"
+files:
+  - path: people.csv
+    content: |
+      name,city
+      Alice,Portland
+      Bob,Seattle
+      Carol,Portland
+script: |
+  open people.csv | where city == "Portland" | get name
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "Alice"
+  - type: stdout_contains
+    value: "Carol"
+  - type: stdout_not_contains
+    value: "Bob"

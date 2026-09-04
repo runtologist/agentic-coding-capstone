@@ -1,0 +1,15 @@
+name: "where compares filesize values with kb/mb units"
+files:
+  - path: tiny.txt
+    content: "x"
+  - path: medium.txt
+    content: "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+script: |
+  ls | where size > 100b | get name
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "medium.txt"
+  - type: stdout_not_contains
+    value: "tiny.txt"

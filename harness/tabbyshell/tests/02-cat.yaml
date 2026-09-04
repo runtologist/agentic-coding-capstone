@@ -1,0 +1,11 @@
+name: "cat prints raw file contents"
+files:
+  - path: hello.txt
+    content: "hello world\n"
+script: |
+  cat hello.txt
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "hello world"

@@ -1,0 +1,15 @@
+name: "length counts the rows of a table"
+files:
+  - path: a.txt
+    content: "1"
+  - path: b.txt
+    content: "2"
+  - path: c.txt
+    content: "3"
+script: |
+  ls | length
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "3"

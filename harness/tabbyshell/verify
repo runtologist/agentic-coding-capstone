@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+lang=""
+implementation_root=""
+args=()
+
+die() { echo "error: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --lang) [ $# -ge 2 ] || die "--lang requires ts, rust, or scala"; lang="$2"; shift 2 ;;
+    --implementation-root) [ $# -ge 2 ] || die "--implementation-root requires a path"; implementation_root="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: verify --lang ts|rust|scala --implementation-root PATH [harness options]"
+      exit 0
+      ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+case "$lang" in ts|rust|scala) ;; *) die "--lang must be explicitly set to ts, rust, or scala" ;; esac
+[ -n "$implementation_root" ] || die "--implementation-root is required"
+[ -d "$implementation_root" ] || die "implementation root not found: $implementation_root"
+implementation_root="$(cd "$implementation_root" && pwd)"
+
+case "$lang" in
+  ts) (cd "$implementation_root" && npm install --silent && npm run build) ;;
+  rust) (cd "$implementation_root" && cargo build --release) ;;
+  scala) (cd "$implementation_root" && sbt assembly) ;;
+esac
+
+exec "$PROJECT_ROOT/run_tests" \
+  --lang "$lang" \
+  --implementation-root "$implementation_root" \
+  "${args[@]+"${args[@]}"}"

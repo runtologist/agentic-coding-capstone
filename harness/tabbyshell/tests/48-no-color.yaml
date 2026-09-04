@@ -1,0 +1,11 @@
+name: "--no-color produces no ANSI escape sequences"
+files:
+  - path: a.txt
+    content: "x"
+script: |
+  ls
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_not_contains
+    value: "\u001b["

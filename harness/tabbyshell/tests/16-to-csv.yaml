@@ -1,0 +1,14 @@
+name: "to csv emits header + comma-separated rows"
+files:
+  - path: items.json
+    content: |
+      [{"name":"apple","price":"1.5"},{"name":"banana","price":"0.5"}]
+script: |
+  open items.json | to csv
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "name,price"
+  - type: stdout_contains
+    value: "apple"

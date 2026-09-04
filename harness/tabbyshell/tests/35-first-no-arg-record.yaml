@@ -1,0 +1,23 @@
+name: "first with no argument returns the first row as a Record"
+files:
+  - path: people.csv
+    content: |
+      name,city
+      Alice,Portland
+      Bob,Seattle
+script: |
+  open people.csv | first
+assertions:
+  - type: exit_code
+    value: 0
+  # Record is rendered as 2-col key|value table
+  - type: stdout_contains
+    value: "key"
+  - type: stdout_contains
+    value: "value"
+  - type: stdout_contains
+    value: "Alice"
+  - type: stdout_contains
+    value: "Portland"
+  - type: stdout_not_contains
+    value: "Bob"

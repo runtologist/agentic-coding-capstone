@@ -1,0 +1,18 @@
+name: "save with .csv extension writes CSV from a Table"
+files:
+  - path: items.json
+    content: |
+      [{"name":"a","val":1},{"name":"b","val":2}]
+script: |
+  open items.json | save out.csv
+assertions:
+  - type: exit_code
+    value: 0
+  - type: file_exists
+    path: out.csv
+  - type: file_content
+    path: out.csv
+    equals: |
+      name,val
+      a,1
+      b,2

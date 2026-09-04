@@ -1,0 +1,14 @@
+name: "cd changes the current working directory for subsequent commands"
+setup:
+  - shell: "mkdir -p subdir && echo hello > subdir/inside.txt"
+script: |
+  cd subdir
+  pwd
+  cat inside.txt
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "subdir"
+  - type: stdout_contains
+    value: "hello"

@@ -1,0 +1,12 @@
+name: "cd - returns to the previous directory"
+setup:
+  - shell: "mkdir -p subdir"
+script: |
+  cd subdir
+  cd -
+  pwd
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_not_contains
+    value: "subdir"

@@ -1,0 +1,17 @@
+name: "to json pretty-prints with 2-space indent and trailing newline"
+files:
+  - path: items.json
+    content: |
+      [{"name":"a"}]
+script: |
+  open items.json | to json
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_equals
+    value: |
+      [
+        {
+          "name": "a"
+        }
+      ]

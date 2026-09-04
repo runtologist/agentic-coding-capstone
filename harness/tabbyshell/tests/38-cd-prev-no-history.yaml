@@ -1,0 +1,10 @@
+name: "cd - with no previous directory errors with BadArg"
+script: |
+  cd -
+assertions:
+  - type: exit_code
+    value: 1
+  - type: stderr_contains
+    value: "cd:"
+  - type: stderr_contains
+    value: "previous"

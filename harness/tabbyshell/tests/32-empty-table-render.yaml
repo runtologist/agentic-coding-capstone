@@ -1,0 +1,15 @@
+name: "empty table after where filter still renders headers"
+files:
+  - path: a.txt
+    content: "x"
+script: |
+  ls | where size > 1mb
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "name"
+  - type: stdout_contains
+    value: "size"
+  - type: stdout_not_contains
+    value: "a.txt"

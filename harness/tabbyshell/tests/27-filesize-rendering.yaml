@@ -1,0 +1,10 @@
+name: "filesize renders SI units (KB) for small files"
+setup:
+  - shell: "head -c 1500 /dev/zero > kb.bin"
+script: |
+  ls | where name == "kb.bin" | get size
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "1.5 KB"

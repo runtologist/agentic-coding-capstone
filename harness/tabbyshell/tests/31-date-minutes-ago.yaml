@@ -1,0 +1,11 @@
+name: "date in 60s..3600s window renders as 'N minutes ago'"
+now: 1700000000
+setup:
+  - shell: "touch -d '2023-11-14T22:08:20Z' a.txt"   # 5 minutes earlier
+script: |
+  ls | get modified
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "5 minutes ago"

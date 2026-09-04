@@ -1,0 +1,15 @@
+name: "sort-by orders rows by the named column"
+files:
+  - path: a.txt
+    content: "z"
+  - path: b.txt
+    content: "yyyyyyyyyy"
+  - path: c.txt
+    content: "xx"
+script: |
+  ls | sort-by size | select name
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_matches
+    pattern: "a\\.txt[\\s\\S]*c\\.txt[\\s\\S]*b\\.txt"

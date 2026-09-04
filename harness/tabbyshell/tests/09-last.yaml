@@ -1,0 +1,19 @@
+name: "last 1 keeps only the final row"
+files:
+  - path: a.txt
+    content: "1"
+  - path: b.txt
+    content: "2"
+  - path: c.txt
+    content: "3"
+script: |
+  ls | sort-by name | last 1 | select name
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "c.txt"
+  - type: stdout_not_contains
+    value: "a.txt"
+  - type: stdout_not_contains
+    value: "b.txt"

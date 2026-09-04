@@ -1,0 +1,19 @@
+name: "save writes structured data using extension"
+files:
+  - path: input.csv
+    content: |
+      name,city
+      Alice,Portland
+script: |
+  open input.csv | save out.json
+assertions:
+  - type: exit_code
+    value: 0
+  - type: file_exists
+    path: out.json
+  - type: file_content
+    path: out.json
+    contains: "Alice"
+  - type: file_content
+    path: out.json
+    contains: "Portland"

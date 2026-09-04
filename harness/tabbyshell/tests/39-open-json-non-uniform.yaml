@@ -1,0 +1,12 @@
+name: "open .json with non-uniform records produces a List<Record>"
+files:
+  - path: items.json
+    content: |
+      [{"name":"apple"},{"name":"banana","stock":25}]
+script: |
+  open items.json | length
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "2"

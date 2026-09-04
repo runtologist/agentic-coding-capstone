@@ -1,0 +1,9 @@
+name: "external command with TABBY_DISABLE_AI returns Str(stdout)"
+no_ai: true
+script: |
+  echo hello world
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "hello world"

@@ -1,0 +1,12 @@
+name: "open .json with a single object produces a Record"
+files:
+  - path: cfg.json
+    content: |
+      {"name":"tabbyshell","version":"0.1.0"}
+script: |
+  open cfg.json | get name
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "tabbyshell"

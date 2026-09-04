@@ -1,0 +1,23 @@
+name: "ls produces a table with name/type/size/modified columns"
+files:
+  - path: a.txt
+    content: "alpha"
+  - path: b.txt
+    content: "bravo bravo"
+script: |
+  ls
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "name"
+  - type: stdout_contains
+    value: "type"
+  - type: stdout_contains
+    value: "size"
+  - type: stdout_contains
+    value: "modified"
+  - type: stdout_contains
+    value: "a.txt"
+  - type: stdout_contains
+    value: "b.txt"

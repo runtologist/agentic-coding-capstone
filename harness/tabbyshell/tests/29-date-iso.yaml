@@ -1,0 +1,11 @@
+name: "date older than 1 year renders as ISO YYYY-MM-DD"
+now: 1700000000   # Tue Nov 14 2023 22:13:20 UTC
+setup:
+  - shell: "touch -d '2020-06-15T12:00:00Z' old.txt"
+script: |
+  ls | get modified
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "2020-06-15"

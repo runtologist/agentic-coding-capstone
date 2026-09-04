@@ -1,0 +1,13 @@
+name: "lines starting with # are comments and are ignored"
+files:
+  - path: a.txt
+    content: "1"
+script: |
+  # this is a comment
+  ls | get name
+  # another comment
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "a.txt"

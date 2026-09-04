@@ -1,0 +1,11 @@
+name: "external command with non-zero exit produces ExternalFailed error"
+no_ai: true
+script: |
+  sh -c "exit 7"
+assertions:
+  - type: exit_code
+    value: 1
+  - type: stderr_contains
+    value: "sh:"
+  - type: stderr_contains
+    value: "external command exited with status 7"

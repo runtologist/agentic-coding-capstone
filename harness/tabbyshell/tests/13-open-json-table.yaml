@@ -1,0 +1,18 @@
+name: "open <file>.json with array of records produces a table"
+files:
+  - path: items.json
+    content: |
+      [{"name":"apple","stock":10},{"name":"banana","stock":25}]
+script: |
+  open items.json | sort-by name
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "name"
+  - type: stdout_contains
+    value: "stock"
+  - type: stdout_contains
+    value: "apple"
+  - type: stdout_contains
+    value: "banana"

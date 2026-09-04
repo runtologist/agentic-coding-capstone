@@ -1,0 +1,17 @@
+name: "select projects only the named columns"
+files:
+  - path: a.txt
+    content: "x"
+script: |
+  ls | select name
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "name"
+  - type: stdout_contains
+    value: "a.txt"
+  - type: stdout_not_contains
+    value: "modified"
+  - type: stdout_not_contains
+    value: "size"

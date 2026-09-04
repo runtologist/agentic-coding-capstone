@@ -1,0 +1,12 @@
+name: "filesize 1950 bytes rounds to 2 KB (trailing .0 trimmed)"
+setup:
+  - shell: "head -c 1950 /dev/zero > big.bin"
+script: |
+  ls | where name == "big.bin" | get size
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "2 KB"
+  - type: stdout_not_contains
+    value: "1.9 KB"

@@ -1,0 +1,20 @@
+name: "List<scalar> renders as a 2-column # | value table"
+files:
+  - path: people.csv
+    content: |
+      name
+      Alice
+      Bob
+script: |
+  open people.csv | get name
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_equals
+    value: |
+      ╭───┬───────╮
+      │ # │ value │
+      ├───┼───────┤
+      │ 0 │ Alice │
+      │ 1 │ Bob   │
+      ╰───┴───────╯

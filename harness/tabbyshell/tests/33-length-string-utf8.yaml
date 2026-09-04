@@ -1,0 +1,11 @@
+name: "length on a string counts UTF-8 code points (not bytes)"
+files:
+  - path: chars.txt
+    content: "héllo"
+script: |
+  cat chars.txt | length
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "5"

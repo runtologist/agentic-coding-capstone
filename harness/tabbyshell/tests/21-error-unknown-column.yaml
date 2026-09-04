@@ -1,0 +1,15 @@
+name: "selecting a missing column produces a typed error"
+files:
+  - path: a.txt
+    content: "1"
+script: |
+  ls | select nonexistent
+assertions:
+  - type: exit_code
+    value: 1
+  - type: stderr_contains
+    value: "select"
+  - type: stderr_contains
+    value: "column not found"
+  - type: stderr_contains
+    value: "nonexistent"

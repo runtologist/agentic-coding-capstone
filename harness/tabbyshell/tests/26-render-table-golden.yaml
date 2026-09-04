@@ -1,0 +1,18 @@
+name: "table render produces exact box-drawing output (golden)"
+files:
+  - path: items.json
+    content: |
+      [{"name":"apple","stock":10},{"name":"banana","stock":25}]
+script: |
+  open items.json
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_equals
+    value: |
+      ╭───┬────────┬───────╮
+      │ # │ name   │ stock │
+      ├───┼────────┼───────┤
+      │ 0 │ apple  │    10 │
+      │ 1 │ banana │    25 │
+      ╰───┴────────┴───────╯

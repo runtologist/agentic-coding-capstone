@@ -1,0 +1,11 @@
+name: "with TABBY_NOW set, ls dates render deterministically"
+now: 1700000000
+setup:
+  - shell: "touch -t 202311130000 a.txt"
+script: |
+  ls | select modified
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_matches
+    pattern: "(ago|yesterday|just now|\\d{4}-\\d{2}-\\d{2})"

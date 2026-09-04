@@ -1,0 +1,11 @@
+name: "open on a non-CSV/JSON file returns raw Str"
+files:
+  - path: notes.txt
+    content: "alpha bravo charlie\n"
+script: |
+  open notes.txt
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "alpha bravo charlie"

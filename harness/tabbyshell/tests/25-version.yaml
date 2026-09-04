@@ -1,0 +1,8 @@
+name: "--version prints tabbyshell <version> and exits 0"
+script: ""
+extra_args: ["--version"]
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_matches
+    pattern: "^tabbyshell \\d+\\.\\d+\\.\\d+\\n$"

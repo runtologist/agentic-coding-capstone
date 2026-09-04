@@ -1,0 +1,15 @@
+name: "get extracts a column as a list"
+files:
+  - path: a.txt
+    content: "1"
+  - path: b.txt
+    content: "2"
+script: |
+  ls | sort-by name | get name
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "a.txt"
+  - type: stdout_contains
+    value: "b.txt"

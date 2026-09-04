@@ -1,0 +1,8 @@
+name: "a parse error produces exit code 1 and a parse-error message"
+script: |
+  ls |
+assertions:
+  - type: exit_code
+    value: 1
+  - type: stderr_contains
+    value: "parse error"

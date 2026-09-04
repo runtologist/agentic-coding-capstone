@@ -1,0 +1,8 @@
+name: "pwd prints the current working directory"
+script: |
+  pwd
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_matches
+    pattern: "^/.+\n$"

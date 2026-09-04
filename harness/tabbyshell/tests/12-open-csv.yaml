@@ -1,0 +1,22 @@
+name: "open <file>.csv parses it as a table"
+files:
+  - path: people.csv
+    content: |
+      name,age,city
+      Alice,30,Portland
+      Bob,25,Seattle
+script: |
+  open people.csv
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_contains
+    value: "name"
+  - type: stdout_contains
+    value: "age"
+  - type: stdout_contains
+    value: "city"
+  - type: stdout_contains
+    value: "Alice"
+  - type: stdout_contains
+    value: "Portland"

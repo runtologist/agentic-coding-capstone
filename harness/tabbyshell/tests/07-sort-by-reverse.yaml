@@ -1,0 +1,15 @@
+name: "sort-by --reverse reverses the order"
+files:
+  - path: a.txt
+    content: "z"
+  - path: b.txt
+    content: "yyyyyyyyyy"
+  - path: c.txt
+    content: "xx"
+script: |
+  ls | sort-by size --reverse | select name
+assertions:
+  - type: exit_code
+    value: 0
+  - type: stdout_matches
+    pattern: "b\\.txt[\\s\\S]*c\\.txt[\\s\\S]*a\\.txt"
