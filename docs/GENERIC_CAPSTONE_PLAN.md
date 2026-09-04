@@ -25,6 +25,10 @@ Every task is "done" only when ALL of these pass:
 5. `sbt --client scalafmtCheckAll` — formatting is clean.
 6. Manual adversarial probes: edge cases NOT covered by public tests.
 7. No hardcoded secrets; env vars only (`OPENROUTER_API_KEY`, etc.).
+8. Production-code coverage: ≈80% statement coverage on `src/main/scala`,
+   measured with sbt-scoverage per §10. Pure-data ADT leaves are exempt from
+   dedicated tests; smart constructors, validators, parsers, renderers, and
+   execution logic are not.
 
 ## 1. Intake (before writing code)
 
@@ -331,6 +335,9 @@ Gotchas learned:
   focused failing logs, name the failing contract, classify cause, reproduce
   narrowly, patch forward.
 - Determinism: freeze time/env in tests; verify no wall-clock or locale leaks.
+- Coverage: run the §10 coverage protocol before declaring the capstone
+  passed; save the scoverage report paths and the per-class table in the
+  ledger.
 
 ## 6. Definition of "passed the capstone"
 
@@ -488,4 +495,63 @@ Process lessons for future rounds:
 - Disjoint-file lanes merged into `main` cleanly; even two lanes editing
   different regions of one file auto-merged, but treat that as the exception
   and prefer disjoint file ownership when forming lanes.
+
+## 10. Coverage extension protocol (Scala)
+
+Goal: ≈80% statement coverage on production code (`src/main/scala`),
+measured with sbt-scoverage on the full unit-test suite. Branch coverage is a
+secondary diagnostic signal used to find untested conditionals, not a hard
+gate. The official acceptance harness runs out-of-process, so it does not
+count toward this measurement — coverage must come from in-process unit tests.
+
+TabbyShell baseline (2026-09-04, 91 unit tests): statement **54.46%**,
+branch **48.27%**. Strong: Value 100%, Parser 100%, Csv 88%, Json 86%,
+Render 81%. Weak: Executor 39% (842 stmts), LineParser 68% (565), Main 0%
+(323), External 0% (191), CliOptions 0% (8), TabbyError 76%.
+
+Scope rules:
+
+- Pure-data ADT leaves (case classes/objects that only carry data, e.g.
+  error leaves with no logic) do not need dedicated tests; they typically
+  count only a handful of statements.
+- Smart constructors and validators (e.g. `Value.table`, `Value.record`,
+  `Value.tableFromUniformRecords`), error formatting (e.g.
+  `TabbyError.ioMessage`), parsers, renderers, and command execution logic
+  ARE production logic and must be covered.
+- Tests must pin observable behavior (values, error variants/messages,
+  rendered strings, file bytes, exit codes); no assertion-free execution just
+  to raise coverage.
+
+Measurement:
+
+1. Add sbt-scoverage temporarily: `project/coverage.sbt` containing
+   `addSbtPlugin("org.scoverage" % "sbt-scoverage" % "2.4.4")`, then
+   `sbt --client shutdown` so the server reloads plugins.
+2. Run `sbt --client "coverage; test; coverageReport"` (long-running: use
+   `bg_run` with a timeout in the orchestrator session).
+3. Read statement/branch totals and per-class numbers from
+   `tabbyshell/target/scala-*/scoverage-report/scoverage.xml`; record them in
+   the ledger with the report path.
+4. Remove `project/coverage.sbt`, run `sbt --client "coverageOff; clean"`
+   then `sbt --client shutdown` so later builds are not instrumented.
+
+Coverage extension wave (parallel subagents):
+
+1. Baseline first: measure coverage and list per-class statement/branch
+   percentages; sort gaps by absolute uncovered statement count.
+2. Split the gaps into lanes with disjoint file ownership, one lane per
+   module. A lane owns its test file(s) plus at most one production file,
+   which it may change only for testability: widen `private` to
+   `private[tabbyshell]` or extract a pure helper with identical behavior.
+   No behavior changes, no new dependencies, no build-file edits.
+3. Lane gates (inside the lane, synchronous): `sbt --client compile`,
+   `sbt --client test`, `sbt --client "scalafmtAll; scalafmtCheckAll"`, then
+   `sbt --client shutdown`. Lanes do not run the official harness and do not
+   measure coverage themselves.
+4. The integrator merges lanes sequentially into `main`, then runs the full
+   non-negotiable gate set including assembly, the official harness, and a
+   fresh coverage report. If coverage is still under target, launch another
+   wave aimed at the remaining largest gaps.
+5. Record lane commits, merged HEAD, and before/after coverage numbers in
+   the ledger.
 
