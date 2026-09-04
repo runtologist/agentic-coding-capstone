@@ -81,3 +81,4 @@ After any sbt config change: `sbt --client shutdown` first.
 | 2026-09-05 | C wave-4 | L4 (e4a6613) + L5 (80a5d51) merged to develop as 4623f79 + 8142f5e; combined gate green: 400 tests (333 + 47 L4 + 20 L5), assembly + scalafmt clean | gate task ba3979038; harness baseline 0/28 pre-L7 (b851364be) |
 | 2026-09-05 | C wave-4 merged | L4 (e4a6613) + L5 (80a5d51) merged into develop → 8142f5e; combined gate green: 400 tests, assembly + scalafmt clean. Harness baseline pre-L7: 0/28 (Main still scaffold) | gate ba3979038 |
 | 2026-09-05 | C wave-5 | L7 packet written (Commands + Main integration, harness 28/28 as DoD); dispatching final lane | docs/snap/packets/L7-commands-main.md |
+| 2026-09-05 | Process rule | User directive: always dispatch subagents with fresh context and self-contained prompts; never fork-context (forked orchestrator history caused two worker derailments) | applied to L7 re-dispatch (defeb14e) and all future lanes |
