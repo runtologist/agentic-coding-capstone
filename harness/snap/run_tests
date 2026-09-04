@@ -49,21 +49,10 @@ case "$lang" in
       jar="$(find "$implementation_root/target" -path '*/scala-*/*-assembly-*.jar' -type f | head -n 1)"
     fi
     [ -n "$jar" ] || die "could not locate snap assembly jar under $implementation_root/target"
-    # The harness pins LANG=C/LC_ALL=C for output determinism, but on Linux the
-    # JVM derives filename encoding (sun.jnu.encoding) from the process locale;
-    # plain C means ASCII and mangles UTF-8 file names (SPEC §2). Restore a
-    # UTF-8 locale in the wrapper so file names round-trip correctly. The
-    # -Dsun.jnu.encoding flag is NOT honored at runtime on JDK 18+, and
-    # -Dfile.encoding=UTF-8 only covers stream/charset defaults, so the locale
-    # export is the load-bearing piece.
     # -Dsun.misc.unsafe.memory.access=allow silences Java 25's sun.misc.Unsafe
     # deprecation WARNINGs (emitted by Scala 3.3.x LazyVals) to stderr; Snap's
     # suite asserts stderr_equals "" on success paths, so they must not leak.
-    cat > "$wrapper" <<WRAPPER
-#!/bin/sh
-export LANG=C.UTF-8 LC_ALL=C.UTF-8
-exec java -Dfile.encoding=UTF-8 -Dsun.misc.unsafe.memory.access=allow -jar "$jar" "\$@"
-WRAPPER
+    printf '#!/bin/sh\nexec java -Dsun.misc.unsafe.memory.access=allow -jar "%s" "$@"\n' "$jar" > "$wrapper"
     ;;
   *)
     die "this workspace only implements the Scala edition; use --lang scala"
