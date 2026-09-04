@@ -547,7 +547,9 @@ Coverage extension wave (parallel subagents):
 3. Lane gates (inside the lane, synchronous): `sbt --client compile`,
    `sbt --client test`, `sbt --client "scalafmtAll; scalafmtCheckAll"`, then
    `sbt --client shutdown`. Lanes do not run the official harness and do not
-   measure coverage themselves.
+   measure coverage themselves. Never use interactive sbt tasks in a lane
+   (`sbt console`, `sbt shell`): piped input does not terminate cleanly and
+   the lane hangs indefinitely — only bounded batch commands.
 4. The integrator merges lanes sequentially into `main`, then runs the full
    non-negotiable gate set including assembly, the official harness, and a
    fresh coverage report. If coverage is still under target, launch another

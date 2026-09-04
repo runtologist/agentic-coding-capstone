@@ -47,19 +47,62 @@ scalafmtCheckAll`, then `sbt --client shutdown`.
 
 | Lane key | Owned test file(s) | Production file (testability-only edits allowed) | Target | Status | Commit |
 |---|---|---|---|---|---|
-| `cov-executor` | `ExecutorSpec.scala` | `Executor.scala` | 39→80% | dispatched | — |
-| `cov-main` | `MainSpec.scala` (new) | `Main.scala` | 0→60%+ | dispatched | — |
-| `cov-external` | `ExternalSpec.scala` (new) | `External.scala` | 0→70%+ | dispatched | — |
-| `cov-parser` | `ParserSpec.scala` | `Parser.scala` | 68→85%+ | dispatched | — |
-| `cov-render-json-csv` | `RenderSpec`, `JsonSpec`, `CsvSpec`, `TabbyErrorSpec` | none | 80%+ each | dispatched | — |
+| `cov-executor` | `ExecutorSpec.scala` | `Executor.scala` | 39→80% | merged (`dfb6df2`) | `167d1ab` |
+| `cov-main` | `MainSpec.scala` (new) | `Main.scala` | 0→60%+ | merged (`a51c7ce`) | `d1e38e3` |
+| `cov-external` | `ExternalSpec.scala` (new) | `External.scala` | 0→70%+ | merged (`fceef54`) | `4b4b276` |
+| `cov-parser` | `ParserSpec.scala` | none | 68→85%+ | retry lane patch applied (`780d188`) | `f193605f` |
+| `cov-render-json-csv` | `RenderSpec`, `JsonSpec`, `CsvSpec`, `TabbyErrorSpec` | none | 80%+ each | merged (`6e5d07d`) | `ae6b262` |
+
+Wave 1 notes:
+- First `cov-parser` lane (`d8016d42`) hung ~9 min piping a heredoc into
+  `sbt --client console` (interactive REPL never exits cleanly through a pipe);
+  killed, worktree cleaned, re-dispatched as `f193605f` with a no-console rule.
+- Lanes ran `sbt --client shutdown` on completion; no stray servers remained
+  after integration.
+- All lane branches were pruned by worktree cleanup; merged by commit hash
+  (commits remained reachable).
 
 ### Rulings / parked items
 
 - SIGINT/Ctrl-C REPL handling remains parked (needs real signal handling).
-- `External.run` live process execution may be left partially uncovered if
-  tests would become environment-dependent; record whatever the lane skips.
+- `External.callAi` success path (live HTTP) intentionally uncovered;
+  `run`/`formatWithAi` covered via injected env (`runWithEnv` seam).
+- Main REPL cluster (`repl`, `readLogicalLine`, `appendHistory`,
+  `printBanner`, `findBannerPath`, `goodbye`) and `Main.run` (calls
+  `exit`) parked; `runScript` `catchAllCause` defect branch not
+  deterministically triggerable.
 
 ## Integration log
 
-- (pending) merge lanes sequentially into `main`; full gates + fresh
-  scoverage report after final merge; record before/after numbers here.
+- 2026-09-04: merged cov-executor (`dfb6df2`), cov-main (`a51c7ce`),
+  cov-external (`fceef54`), cov-render-json-csv (`6e5d07d`) sequentially into
+  `main`; applied cov-parser retry patch (`780d188`). Gates after final merge:
+  - `sbt --client "compile; Test/compile; test; assembly; scalafmtCheckAll"`:
+    **411 tests passed, 0 failed** (baseline was 91); assembly jar built.
+  - Official harness: **50 passed, 0 failed** on HEAD `780d188`.
+  - Coverage (sbt-scoverage 2.4.4, temporary plugin, then removed):
+    statement **91.92%** (baseline 54.46%), branch **89.85%** (baseline
+    48.27%) — exceeds the ≈80% target.
+
+### Post-wave coverage (HEAD `780d188`, 411 unit tests)
+
+| Class | Stmts | Stmt % | Branch % |
+|---|---:|---:|---:|
+| Executor | 842 | 97.51 | 96.58 |
+| LineParser | 565 | 94.51 | 87.73 |
+| Render | 409 | 95.60 | 93.33 |
+| Main | 327 | 56.57 | 55.00 |
+| JsonParser | 280 | 95.71 | 93.15 |
+| External | 196 | 90.31 | 89.36 |
+| Csv | 133 | 100.00 | 100.00 |
+| Json | 132 | 97.73 | 97.22 |
+| Value | 92 | 100.00 | 100.00 |
+| TabbyError | 41 | 95.12 | 100.00 |
+| Parser | 26 | 100.00 | 100.00 |
+| CliOptions | 8 | 100.00 | 100.00 |
+| remaining leaves | 9 | 100.00 | 100.00 |
+
+Overall: **91.92% statement / 89.85% branch** — target (≈80% stmt) met.
+Remaining Main gap is the interactive REPL cluster and `Main.run` exit path
+(parked above); remaining External gap is the live HTTP call.
+
