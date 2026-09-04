@@ -7,7 +7,14 @@ WORKSHOP_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
 source "$SCRIPT_DIR/env.sh"
 
-exec "$WORKSHOP_ROOT/capstones/tabbyshell/verify" \
+# Prefer the vendored harness inside this repo; fall back to the workshop copy.
+if [ -x "$REPO_ROOT/harness/tabbyshell/verify" ]; then
+  VERIFY="$REPO_ROOT/harness/tabbyshell/verify"
+else
+  VERIFY="$WORKSHOP_ROOT/capstones/tabbyshell/verify"
+fi
+
+exec "$VERIFY" \
   --lang scala \
   --implementation-root "$REPO_ROOT/tabbyshell" \
   "$@"

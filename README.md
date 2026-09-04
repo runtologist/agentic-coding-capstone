@@ -1,5 +1,7 @@
 # Scala Capstone Workspace
 
+![CI](https://github.com/runtologist/agentic-coding-capstone/actions/workflows/capstone-ci.yml/badge.svg)
+
 This repository contains generated Scala code, planning documents, and scripts
 for the workshop capstone. The intended capstone is **Snap**. TabbyShell is
 used as a practice project to validate the toolchain, harness interface,
@@ -9,11 +11,27 @@ generic plan, and parallel-subagent workflow.
 
 ```text
 capstone-scala/
-  docs/                     # Generic plan, contracts, findings, task templates
-  scripts/                  # Environment and verification helper scripts
-  tabbyshell/               # Practice Scala implementation for TabbyShell
-  snap/                     # Future Snap implementation, created when spec is available
+  .github/workflows/    # CI: sbt tests + generic acceptance suite per project
+  docs/                 # Generic plan, contracts, findings, task templates
+  harness/              # Vendored, unmodified workshop acceptance harnesses
+    tabbyshell/         #   (verify, run_tests, test-harness, tests, fixtures)
+  scripts/              # Environment and verification helper scripts
+  tabbyshell/           # Practice Scala implementation for TabbyShell
+  snap/                 # Future Snap implementation, created when spec is available
 ```
+
+## Continuous Integration
+
+`.github/workflows/capstone-ci.yml` auto-discovers every top-level directory
+containing a `build.sbt` and, for each project, runs:
+
+1. `sbt scalafmtCheckAll; test; assembly` — formatting gate, unit tests, fat
+   jar.
+2. The matching vendored acceptance harness at `harness/<project>/run_tests`
+   (skipped if no harness is vendored for that project yet).
+
+New capstones are picked up automatically: add `<name>/build.sbt` and vendor
+the workshop harness into `harness/<name>/`.
 
 ## Environment
 

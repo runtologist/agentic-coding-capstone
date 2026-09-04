@@ -1,0 +1,88 @@
+name: capstone-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  discover-projects:
+    name: Discover capstone projects
+    runs-on: ubuntu-latest
+    outputs:
+      projects: ${{ steps.find.outputs.projects }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find Scala capstone projects (top-level dirs with build.sbt)
+        id: find
+        run: |
+          projects=$(find . -mindepth 2 -maxdepth 2 -name build.sbt \
+            -not -path './harness/*' -not -path './.git/*' \
+            -exec dirname {} \; | sed 's|^\./||' | sort -u \
+            | jq -R . | jq -s -c .)
+          echo "projects=${projects}" >> "$GITHUB_OUTPUT"
+
+  capstone-tests:
+    name: ${{ matrix.project }}
+    needs: discover-projects
+    if: needs.discover-projects.outputs.projects != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJson(needs.discover-projects.outputs.projects) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Cache sbt/Coursier artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ivy2/cache
+            ~/.sbt
+            ~/.cache/coursier
+          key: ${{ runner.os }}-sbt-${{ matrix.project }}-${{ hashFiles(format('{0}/build.sbt', matrix.project), format('{0}/project/**', matrix.project)) }}
+          restore-keys: |
+            ${{ runner.os }}-sbt-${{ matrix.project }}-
+            ${{ runner.os }}-sbt-
+
+      - name: Format check, unit tests, assembly
+        working-directory: ${{ matrix.project }}
+        run: sbt -batch -Dsbt.ci=true "scalafmtCheckAll; test; assembly"
+
+      - name: Check for vendored acceptance harness
+        id: harness
+        run: |
+          if [ -x "harness/${{ matrix.project }}/run_tests" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js
+        if: steps.harness.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: harness/${{ matrix.project }}/test-harness/package-lock.json
+
+      - name: Install harness dependencies
+        if: steps.harness.outputs.present == 'true'
+        working-directory: harness/${{ matrix.project }}/test-harness
+        run: npm ci
+
+      - name: Run generic acceptance test suite
+        if: steps.harness.outputs.present == 'true'
+        run: harness/${{ matrix.project }}/run_tests --lang scala --implementation-root "${GITHUB_WORKSPACE}/${{ matrix.project }}"
