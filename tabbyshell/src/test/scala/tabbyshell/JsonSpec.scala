@@ -112,6 +112,127 @@ object JsonSpec extends ZIOSpecDefault {
       test("escapes control characters as unicode escapes") {
         val expected = "\"" + "\\" + "u0001" + "\""
         assertTrue(Json.quote(1.toChar.toString) == expected)
+      },
+      test("escapes empty strings and remaining named controls") {
+        val named = "\"" + "\\" + "b" + "\\" + "f" + "\\" + "r" + "\""
+        val nul = "\"" + "\\" + "u0000" + "\""
+        assertTrue(
+          Json.quote("") == "\"\"",
+          Json.quote("\b\f\r") == named,
+          Json.quote(0.toChar.toString) == nul
+        )
+      }
+    ),
+    suite("parse whitespace and nesting")(
+      test("accepts whitespace and newlines around tokens") {
+        val text = " \t\r\n { \"a\" : [ 1 , 2 ] } \n "
+        val expected = Value.recordTrusted(List("a" -> VList(List(VInt(1L), VInt(2L)))))
+        assertTrue(Json.parse(text) == Right(expected))
+      },
+      test("parses nested arrays and objects") {
+        val text = "{\"a\":{\"b\":[1,{\"c\":null}]}}"
+        val expected = Value.recordTrusted(
+          List(
+            "a" -> Value.recordTrusted(
+              List(
+                "b" -> VList(
+                  List(VInt(1L), Value.recordTrusted(List("c" -> VNull)))
+                )
+              )
+            )
+          )
+        )
+        assertTrue(Json.parse(text) == Right(expected))
+      },
+      test("arrays of empty objects become empty-column tables") {
+        assertTrue(
+          Json.parse("[{}, {}]") == Right(Value.tableTrusted(Nil, List(Nil, Nil)))
+        )
+      }
+    ),
+    suite("parse errors")(
+      test("reports exact positions for structural errors") {
+        assertTrue(
+          Json.parse(" ") == Left("unexpected end of JSON at position 1"),
+          Json.parse("[") == Left("unexpected end of JSON at position 1"),
+          Json.parse("[1,") == Left("unexpected end of JSON at position 3"),
+          Json.parse("tru") == Left("expected 'true' at position 0"),
+          Json.parse("fals") == Left("expected 'false' at position 0"),
+          Json.parse("nul") == Left("expected 'null' at position 0"),
+          Json.parse("truex") == Left("unexpected trailing characters at position 4"),
+          Json.parse("{1:2}") == Left("expected object key string at position 1"),
+          Json.parse("{\"a\" 1}") == Left("expected ':' at position 5"),
+          Json.parse("{\"a\":1 \"b\":2}") == Left("expected ',' or '}' in object at position 7"),
+          Json.parse("[1 2]") == Left("expected ',' or ']' in array at position 3"),
+          Json.parse(".5") == Left("unexpected character '.' at position 0")
+        )
+      },
+      test("reports string and number errors") {
+        val unterminatedEscape = "\"" + "\\"
+        val invalidEscape = "\"" + "\\" + "x" + "\""
+        assertTrue(
+          Json.parse("-") == Left("expected digit at position 1"),
+          Json.parse("1.") == Left("expected digit at position 2"),
+          Json.parse("1e") == Left("expected digit at position 2"),
+          Json.parse("\"abc") == Left("unterminated string at position 4"),
+          Json.parse(unterminatedEscape) == Left("unterminated escape at position 2"),
+          Json.parse(invalidEscape) == Left("invalid escape character 'x' at position 2")
+        )
+      },
+      test("reports invalid unicode escapes") {
+        val badHex = "\"" + "\\" + "u12G4" + "\""
+        val truncated = "\"" + "\\" + "u12" + "\""
+        assertTrue(
+          Json.parse(badHex) == Left("invalid unicode escape '12G4' at position 2"),
+          Json.parse(truncated) == Left("invalid unicode escape at position 2")
+        )
+      }
+    ),
+    suite("parse numbers")(
+      test("parses integer and float forms") {
+        assertTrue(
+          Json.parse("-0") == Right(VInt(0L)),
+          Json.parse("01") == Right(VInt(1L)),
+          Json.parse("-3.25") == Right(VFloat(-3.25)),
+          Json.parse("1E+2") == Right(VFloat(100.0)),
+          Json.parse("1.5e-2") == Right(VFloat(0.015))
+        )
+      },
+      test("falls back to float for integers outside Long range") {
+        Json.parse("9223372036854775808") match {
+          case Right(VFloat(d)) => assertTrue(d > 9.2e18)
+          case _                => assertTrue(false)
+        }
+      },
+      test("overflowing exponents become infinities") {
+        assertTrue(
+          Json.parse("1e309") == Right(VFloat(Double.PositiveInfinity)),
+          Json.parse("-1e309") == Right(VFloat(Double.NegativeInfinity))
+        )
+      }
+    ),
+    suite("pretty extras")(
+      test("renders non-finite floats as null and keeps special scalars raw") {
+        assertTrue(
+          Json.pretty(VFloat(Double.NaN)) == "null\n",
+          Json.pretty(VFloat(Double.PositiveInfinity)) == "null\n",
+          Json.pretty(VFloat(Double.NegativeInfinity)) == "null\n",
+          Json.pretty(VFloat(-0.0)) == "0\n",
+          Json.pretty(VFloat(9007199254740991.0)) == "9007199254740991\n",
+          Json.pretty(VFilesize(1500L)) == "1500\n",
+          Json.pretty(VDate(1735689600L)) == "1735689600\n"
+        )
+      },
+      test("pretty-prints nested empty lists") {
+        val input = VList(List(VList(Nil), VList(List(VNull))))
+        assertTrue(Json.pretty(input) == "[\n  [],\n  [\n    null\n  ]\n]\n")
+      },
+      test("round-trips escaped strings and control characters") {
+        val s = "a\n\"b\"\t" + 1.toChar
+        Json.parse(Json.pretty(VStr(s))) match {
+          case Right(VStr(parsed)) => assertTrue(parsed == s)
+          case _                   => assertTrue(false)
+        }
       }
     )
   )
