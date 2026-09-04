@@ -38,7 +38,7 @@ capstone-scala/
 | Capstone              | Status                          | Evidence                                        |
 | --------------------- | ------------------------------- | ----------------------------------------------- |
 | TabbyShell (practice) | done                            | 50/50 acceptance cases, 411 unit tests, 91.9% statement coverage — see [`docs/tabbyshell/LEDGER.md`](docs/tabbyshell/LEDGER.md) |
-| Snap                  | pending — spec not yet released | —                                                |
+| Snap                  | done                            | 28/28 acceptance cases, 531 unit tests, 90.4% statement coverage — see [`docs/snap/LEDGER.md`](docs/snap/LEDGER.md) |
 
 ## Environment
 
@@ -54,9 +54,17 @@ Full workflow, quality gates, and ground rules live in the
 ```bash
 cd <capstone>
 sbt --client test assembly   # unit gates
-# acceptance suite: bash harness/<capstone>/run_tests --lang scala \
-#   --implementation-root $PWD/<capstone>
+
+# Canonical acceptance validation (from the workshop root):
+./capstones/snap/verify --candidate capstone-scala/scripts/snap
+
+# Or via the vendored harness (from the repo root):
+bash harness/<capstone>/run_tests --lang scala --implementation-root $PWD/<capstone>
 ```
+
+The `scripts/snap` launcher passes `-Dsun.misc.unsafe.memory.access=allow`
+to suppress Java 25 deprecation warnings from `scala.runtime.LazyVals` that
+would otherwise pollute stderr and break byte-exact assertions.
 
 ## Continuous Integration
 

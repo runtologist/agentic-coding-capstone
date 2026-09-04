@@ -21,4 +21,5 @@ node_modules/
 *.local.sh
 
 # scratch / one-off scripts
-scripts/
+scripts/*
+!scripts/snap

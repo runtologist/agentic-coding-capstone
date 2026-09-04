@@ -1,0 +1,24 @@
+#!/bin/sh
+# Launcher for the Snap Scala implementation (assembly jar).
+#
+# Canonical acceptance validation, run from the workshop root:
+#   ./capstones/snap/verify --candidate capstone-scala/scripts/snap
+#
+# Requires `java` (Java 25 LTS) on PATH and the assembly jar built via
+# `cd snap && sbt assembly`.
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+JAR="$SCRIPT_DIR/../snap/target/scala-3.3.8/snap-assembly-0.1.0.jar"
+
+if [ ! -f "$JAR" ]; then
+  echo "snap launcher: jar not found at $JAR" >&2
+  echo "snap launcher: build it with: cd snap && sbt assembly" >&2
+  exit 2
+fi
+
+# -Dsun.misc.unsafe.memory.access=allow silences Java 25 sun.misc.Unsafe
+# deprecation warnings emitted by scala.runtime.LazyVals; without it,
+# byte-exact stderr assertions in the harness fail. Setting the property
+# in-process (Main.scala) is too late — it must be a JVM launch flag.
+exec java -Dsun.misc.unsafe.memory.access=allow -jar "$JAR" "$@"
