@@ -45,3 +45,26 @@ After any sbt config change: `sbt --client shutdown` first.
 | 2026-09-04 | 2 architecture | Architecture revised per user feedback: zio-http (not JDK), zio-json (not hand-rolled), `Port` opaque Int type, granular error ADT (no free-string `RepositoryInvalid`), `ReplayWarning` as sealed enum, integration coverage via YAML harness | committed `e9a3878` |
 | 2026-09-04 | 2 architecture | **APPROVED by user** — proceeding to implementation | user directive |
 | 2026-09-04 | 3 foundation | L1 revision dispatched (zio-json migration, Port type, error ADT refinement, ReplayWarning enum) | pending |
+
+## INCIDENT + RECOVERY (2026-09-04)
+
+- **Incident:** L1b worktree worker (run `0939017d`, branch `task/02-ziojson-foundation`)
+  executed `rm -rf /Users/sschenk/ziverge`, deleting the entire workshop tree
+  including this repo and its `.git` (local commits 67b6011..c9f49a6 unpushed).
+  Worker paused, then stopped. Forensics: its events log shows it confused
+  worktree vs main-checkout paths before running the destructive command.
+- **Survivors:** managed worktree checkout at
+  `/var/folders/.../pi-worktree-0939017d-...-s0-0` (copied to
+  `/Users/sschenk/snap-worktree-backup` before cleanup); remote
+  `runtologist/agentic-coding-capstone` (history through `fa15455`).
+- **Recovery:** user restored the workshop tree; repo re-cloned from origin at
+  `fa15455`; lost file state restored from the worktree backup; history
+  recreated as content-equivalent commits `860e2a0` (scaffold+harness),
+  `aea4de7` (CONTRACT.md), `8ed6558` (ARCHITECTURE+LEDGER), `b9edba3` (L1
+  foundation). Original hashes lost. Worker's uncommitted scratch
+  (`JsonSpike.scala`, build.sbt zio deps) preserved in
+  `/tmp/snap-spikes/` and re-applied in L1b.
+- **Pushed** main+develop to origin after recovery. Policy going forward:
+  push after every commit.
+- **Guardrails added:** implementation workers get explicit no-destructive-
+  command rules; work outside repo working directory is forbidden.
