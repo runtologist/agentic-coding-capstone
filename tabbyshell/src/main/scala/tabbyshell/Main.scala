@@ -27,7 +27,7 @@ import scala.jdk.CollectionConverters.*
   */
 object Main extends ZIOAppDefault {
 
-  private final case class CliOptions(
+  private[tabbyshell] final case class CliOptions(
       showVersion: Boolean = false,
       noColor: Boolean = false,
       interactive: Boolean = false,
@@ -35,7 +35,7 @@ object Main extends ZIOAppDefault {
       evalFile: Option[String] = None
   )
 
-  private val esc = "\u001b"
+  private[tabbyshell] val esc = "\u001b"
 
   override def run: ZIO[ZIOAppArgs & Scope, Any, Any] =
     for {
@@ -44,7 +44,7 @@ object Main extends ZIOAppDefault {
       _ <- exit(code) // terminates the JVM with the requested exit code
     } yield code
 
-  private def program(args: List[String]): UIO[ExitCode] =
+  private[tabbyshell] def program(args: List[String]): UIO[ExitCode] =
     parseArgs(args) match {
       case Left(message) =>
         printErrorLine(color = false, message).as(ExitCode(2))
@@ -52,7 +52,7 @@ object Main extends ZIOAppDefault {
         runOptions(options)
     }
 
-  private def parseArgs(args: List[String]): Either[String, CliOptions] = {
+  private[tabbyshell] def parseArgs(args: List[String]): Either[String, CliOptions] = {
     def loop(remaining: List[String], options: CliOptions): Either[String, CliOptions] =
       remaining match {
         case Nil =>
@@ -141,7 +141,10 @@ object Main extends ZIOAppDefault {
       renderOpts = RenderOpts(color = state.color, maxColWidth = 40, now = state.now)
     } yield (state, renderOpts, isTty)
 
-  private def resolveNow(tabbyNowEnv: Option[String], fallback: Long): IO[TabbyError, Long] =
+  private[tabbyshell] def resolveNow(
+      tabbyNowEnv: Option[String],
+      fallback: Long
+  ): IO[TabbyError, Long] =
     tabbyNowEnv match {
       case None => ZIO.succeed(fallback)
       case Some(raw) =>
@@ -152,7 +155,7 @@ object Main extends ZIOAppDefault {
         }
     }
 
-  private def runScript(
+  private[tabbyshell] def runScript(
       script: String,
       initialState: ShellState,
       opts: RenderOpts
@@ -193,7 +196,7 @@ object Main extends ZIOAppDefault {
     loop(lines, initialState)
   }
 
-  private def readScript(target: String): IO[TabbyError, String] = {
+  private[tabbyshell] def readScript(target: String): IO[TabbyError, String] = {
     if (target == "-") {
       // Idiomatic ZIO: read stdin through the Console service rather than
       // touching scala.io.Source.stdin inside a blocking attempt.
@@ -231,20 +234,21 @@ object Main extends ZIOAppDefault {
   private def printOut(text: String): UIO[Unit] =
     Console.print(text).orDie
 
-  private def printError(color: Boolean, message: String): UIO[Unit] = {
+  private[tabbyshell] def formatError(color: Boolean, message: String): String = {
     val messageWithPrefix = s"✗ $message"
-    val styled =
-      if (color) s"$esc[1;31m$messageWithPrefix$esc[0m"
-      else messageWithPrefix
-    printErrorLine(color, styled)
+    if (color) s"$esc[1;31m$messageWithPrefix$esc[0m"
+    else messageWithPrefix
   }
 
-  private def printErrorLine(color: Boolean, message: String): UIO[Unit] = {
-    val styled =
-      if (color && !message.startsWith(esc)) s"$esc[1;31m$message$esc[0m"
-      else message
-    Console.printLineError(styled).orDie
-  }
+  private[tabbyshell] def formatErrorLine(color: Boolean, message: String): String =
+    if (color && !message.startsWith(esc)) s"$esc[1;31m$message$esc[0m"
+    else message
+
+  private def printError(color: Boolean, message: String): UIO[Unit] =
+    printErrorLine(color, formatError(color, message))
+
+  private def printErrorLine(color: Boolean, message: String): UIO[Unit] =
+    Console.printLineError(formatErrorLine(color, message)).orDie
 
   private def repl(initialState: ShellState, opts: RenderOpts): UIO[ExitCode] = {
     def loop(state: ShellState): UIO[ExitCode] =
@@ -293,7 +297,7 @@ object Main extends ZIOAppDefault {
     } yield code
   }
 
-  private def promptString(state: ShellState): String = {
+  private[tabbyshell] def promptString(state: ShellState): String = {
     val short =
       if (state.cwd == state.home) "~"
       else if (state.home != "/" && state.cwd.startsWith(state.home + "/"))
