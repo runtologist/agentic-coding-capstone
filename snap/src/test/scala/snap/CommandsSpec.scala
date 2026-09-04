@@ -1026,6 +1026,55 @@ object CommandsSpec extends ZIOSpecDefault {
           r == ((1, "", "snap: contributor.id is required; configure it locally or globally\n"))
         )
       }
+    },
+    test("revert fails with overflow error when frontier revision is at max (E1-S1)") {
+      ZIO.scoped {
+        for {
+          base <- tempDir("revert-overflow")
+          repoDir = base.resolve("repo")
+          _ <- ZIO.attemptBlocking(Files.createDirectories(repoDir)).orDie
+          contributor = ContributorId("a@x")
+          maxRev = Model.MaxSafeInteger
+          inMemoryRepo = Repository(
+            Version(Vector(contributor -> maxRev)),
+            Vector(
+              Patch(
+                contributor,
+                1L,
+                Version.empty,
+                "init",
+                Vector(Change.Text("f.txt", Vector(EditOp.Insert(Vector("original\n")))))
+              ),
+              Patch(
+                contributor,
+                maxRev,
+                Version(Vector(contributor -> 1L)),
+                "modify",
+                Vector(
+                  Change.Text(
+                    "f.txt",
+                    Vector(EditOp.Delete(1), EditOp.Insert(Vector("modified\n")))
+                  )
+                )
+              )
+            )
+          )
+          target = Version(Vector(contributor -> 1L))
+          result <- Commands
+            .revertWithRepo(
+              repoDir,
+              inMemoryRepo,
+              target,
+              contributor,
+              Render.Presentation.Plain
+            )
+            .either
+          repoFileWritten <- exists(repoDir.resolve(".snap").resolve("repository.json"))
+        } yield assertTrue(
+          result == Left(SnapError.NotPositiveSafeInteger("revision")),
+          !repoFileWritten
+        )
+      }
     }
   )
 

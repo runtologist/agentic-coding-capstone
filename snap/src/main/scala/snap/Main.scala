@@ -83,7 +83,7 @@ object Main extends ZIOAppDefault {
     * (byte-exact pass-through, the parent prints nothing), overrides `LANG`/`LC_ALL` to `C.UTF-8`,
     * sets the `SNAP_JNU_REEXEC` guard, and waits for the child's exit code. Documented raw-JVM
     * exception mirroring [[Commands.installSignalHandlers]]: the harness signals the whole process
-    * group, so the parent installs no-op TERM/INT handlers after spawning; the child receives the
+    * group, so the parent installs no-op TERM/INT handlers before spawning; the child receives the
     * signal directly and performs its own graceful shutdown, while the parent survives to relay the
     * child's exit code. Returns [[None]] when re-exec is not needed or spawning fails, in which
     * case the caller degrades to normal execution.
@@ -95,7 +95,7 @@ object Main extends ZIOAppDefault {
       try
         Option(getClass.getProtectionDomain.getCodeSource)
           .flatMap(cs => Option(cs.getLocation))
-          .map(_.getPath)
+          .map(l => java.nio.file.Paths.get(l.toURI).toString)
       catch { case _: Throwable => None }
 
     if (!jnuNeedsReexec(jnuEncoding, guardEnv, jarPath)) return None
@@ -107,12 +107,12 @@ object Main extends ZIOAppDefault {
       builder.inheritIO()
       val childEnv = builder.environment()
       reexecEnv.foreach { case (k, v) => childEnv.put(k, v) }
-      val child = builder.start()
       // No-op TERM/INT handlers: the harness signals the whole process group, so the child
       // handles shutdown itself and the parent must survive to relay its exit code.
       val noop: sun.misc.SignalHandler = (_: sun.misc.Signal) => ()
       sun.misc.Signal.handle(new sun.misc.Signal("TERM"), noop)
       sun.misc.Signal.handle(new sun.misc.Signal("INT"), noop)
+      val child = builder.start()
       Some(child.waitFor())
     } catch {
       case _: java.io.IOException => None // degrade gracefully to normal execution
