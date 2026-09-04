@@ -52,10 +52,8 @@ In the workshop root:
 ```bash
 git clone git@github.com:runtologist/.git
 ```
-```
 
 then 
-```
 
 ```bash
 cd agentic-coding-capstone/snap 
