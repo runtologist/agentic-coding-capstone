@@ -160,21 +160,19 @@ object Codec {
     */
   private def checkDotCollisions(patches: Vector[Patch]): Either[SnapError, Unit] = {
     val seen = mutable.HashMap.empty[(String, Long), Patch]
-    var failure: Option[SnapError] = None
-    val it = patches.iterator
-    while (it.hasNext && failure.isEmpty) {
-      val p = it.next()
-      val key = (p.author.value, p.revision)
-      seen.get(key) match {
-        case Some(prev) if !Patch.sameValue(prev, p) =>
-          failure = Some(SnapError.PatchCollision(p.author.value, p.revision))
-        case Some(_) => ()
-        case None    => seen.update(key, p)
-      }
-    }
-    failure match {
-      case Some(err) => Left(err)
-      case None      => Right(())
+    // foldLeft with a Left short-circuit guard replaces the early-exit iterator loop.
+    patches.foldLeft[Either[SnapError, Unit]](Right(())) {
+      case (Left(err), _) => Left(err)
+      case (Right(()), p) =>
+        val key = (p.author.value, p.revision)
+        seen.get(key) match {
+          case Some(prev) if !Patch.sameValue(prev, p) =>
+            Left(SnapError.PatchCollision(p.author.value, p.revision))
+          case Some(_) => Right(())
+          case None =>
+            seen.update(key, p)
+            Right(())
+        }
     }
   }
 
@@ -192,18 +190,15 @@ object Codec {
       repo.patches.groupBy(_.author.value).view.mapValues(_.map(_.revision).toSet).toMap
 
     val authors = maxRev.keys.toVector.sortWith((a, b) => Model.utf8Compare(a, b) < 0)
-    var failure: Option[SnapError] = None
-    val it = authors.iterator
-    while (it.hasNext && failure.isEmpty) {
-      val author = it.next()
-      val revs = present.getOrElse(author, Set.empty[Long])
-      var k = 1L
-      while (k <= maxRev(author) && failure.isEmpty) {
-        if (!revs.contains(k)) failure = Some(SnapError.MissingPatch(author, k))
-        k += 1
+    // First missing revision per author, first author with a gap wins (lazy, short-circuits).
+    authors.iterator
+      .map { author =>
+        val revs = present.getOrElse(author, Set.empty[Long])
+        (1L to maxRev(author))
+          .find(k => !revs.contains(k))
+          .map(SnapError.MissingPatch(author, _))
       }
-    }
-    failure match {
+      .collectFirst { case Some(err) => err } match {
       case Some(err) => Left(err)
       case None      => Right(())
     }
@@ -239,15 +234,20 @@ object Codec {
           val key = (cid.value, rev)
           if (byDot.contains(key) && visited.add(key)) queue.enqueue(key)
         }
-        while (queue.nonEmpty) {
-          val key = queue.dequeue()
-          byDot.get(key).foreach { p =>
-            p.base.components.foreach { case (cid, rev) =>
-              val k = (cid.value, rev)
-              if (byDot.contains(k) && visited.add(k)) queue.enqueue(k)
+        // @tailrec BFS over the mutable queue keeps O(n) behavior without a while loop.
+        @scala.annotation.tailrec
+        def drain(): Unit =
+          if (queue.nonEmpty) {
+            val key = queue.dequeue()
+            byDot.get(key).foreach { p =>
+              p.base.components.foreach { case (cid, rev) =>
+                val k = (cid.value, rev)
+                if (byDot.contains(k) && visited.add(k)) queue.enqueue(k)
+              }
             }
+            drain()
           }
-        }
+        drain()
         repo.patches.collectFirst {
           case p if !visited.contains((p.author.value, p.revision)) =>
             SnapError.UnreachablePatch(p.author.value, p.revision)
@@ -321,22 +321,20 @@ object Codec {
       case Change.Text(path, _) => path
       case Change.Put(path, _)  => path
     }
-    var failure: Option[SnapError] = None
-    var i = 0
-    while (i < paths.length && failure.isEmpty) {
-      var j = i + 1
-      while (j < paths.length && failure.isEmpty) {
-        if (
-          Model.isProperAncestor(paths(i), paths(j)) ||
-          Model.isProperAncestor(paths(j), paths(i))
-        ) failure = Some(SnapError.TreePathsConflict(paths(j)))
-        j += 1
+    // First conflicting pair in original (i, j>i) order; lazy iterators keep the early exit.
+    val conflict = paths.indices.iterator
+      .flatMap { i =>
+        paths.iterator.drop(i + 1).collectFirst {
+          case q
+              if Model.isProperAncestor(paths(i), q) ||
+                Model.isProperAncestor(q, paths(i)) =>
+            q
+        }
       }
-      i += 1
-    }
-    failure match {
-      case Some(err) => Left(err)
-      case None      => Right(())
+      .nextOption()
+    conflict match {
+      case Some(p) => Left(SnapError.TreePathsConflict(p))
+      case None    => Right(())
     }
   }
 
