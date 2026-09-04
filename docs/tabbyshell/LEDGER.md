@@ -124,4 +124,14 @@ Remaining Main gap is the interactive REPL cluster and `Main.run` exit path
 - GitHub Actions first run on push: workflow run 33874539613 (status tracked
   separately; see monitor notes).
 
+## Plan maintenance
+
+- 2026-09-04: Added **Phase B½ — Plan & packet review** to
+  `docs/GENERIC_CAPSTONE_PLAN.md`: after packet drafting (post Phase B
+  approval), fresh-context read-only reviewer lanes validate each packet for
+  scope, file-ownership disjointness, interface conformance, test-first DoD,
+  and verifiability before any writer is dispatched; `fusion_validate`
+  optional advisory check; materially changed packets need re-review. Skills
+  map and background-execution table updated accordingly.
+
 

@@ -91,6 +91,7 @@ Anti-patterns:
 |---|---|---|
 | Intake / contract | `ask-user`, `brainstorming`, `zio-knowledge`, `zio-http-knowledge` | resolving ambiguities, approving the contract, verifying ZIO/library facts |
 | Architecture / planning | `writing-plans`, `brainstorming`, `council-mode`, `plannotator` | deriving architecture, writing CONTRACT/ARCHITECTURE docs, reviewing material decisions |
+| Plan / packet review | `requesting-code-review`, `receiving-code-review`, `fusion_validate` | fresh-context review of the architecture doc and task packets before any writer is dispatched |
 | Foundation / implementation | `subagent-driven-development`, `test-driven-development`, `using-git-worktrees`, `dispatching-parallel-agents`, `pi-subagents` | per-task packets, failing tests first, isolated worktrees, independent lanes |
 | Integration | `finishing-a-development-branch`, `systematic-debugging`, `verification-before-completion` | sequential merges, gate-failure investigation, fresh evidence before claims |
 | Review | `requesting-code-review`, `receiving-code-review`, `pi-subagents` review references | fresh-context review lanes, finding disposition, evidence-based feedback |
@@ -107,6 +108,7 @@ terminal notifications.
 |---|---|---|
 | A, D, F gates | `bg_run` | sbt gate suites and official harness runs, with timeouts |
 | B, F rulings | `fusion_reason` | tool-less multi-model deliberation on tradeoffs and contested findings |
+| B½ plan review | `fusion_validate` | advisory multi-model sanity check of the packet set against the frozen contract |
 | E extra lanes | `fusion_investigate`, `fusion_validate` | clean-context multi-model spec hunt; advisory post-green validation |
 | E triage | `bg_delegate` | inspect-only oracle questions carrying conversation context |
 
@@ -165,7 +167,37 @@ Before any implementation packet is written:
    alternatives) in ARCHITECTURE.md.
 
 Only after approval are Phase C packets created, each referencing the frozen
-contracts in `docs/<project>/ARCHITECTURE.md`.
+contracts in `docs/<project>/ARCHITECTURE.md`. Packets are drafted after B
+approval but must pass Phase B½ review before any writer is dispatched.
+
+### Phase B½ — Plan & packet review (read-only, before dispatch)
+
+After packets are drafted, before any implementation writer launches:
+
+1. Review each packet in isolation. A fresh-context, read-only reviewer
+   receives the packet plus the frozen contract (SPEC.md, ARCHITECTURE.md,
+   CONTRACT.md) and evaluates:
+   - Scope: exactly one module or one cohesive group — nothing broader.
+   - Ownership: no file overlaps with any other packet in the wave.
+   - Interface conformance: codes against the frozen signatures only; does not
+     prescribe changes to shared modules.
+   - Test-first: the definition of done names concrete failing tests or
+     invariant tests that must exist before implementation is accepted.
+   - Verifiability: gate commands, expected evidence, and escalation rules are
+     explicit and runnable by the lane without asking the parent.
+2. Run review lanes in parallel via `runs.all` (read-only, no `acceptance`,
+   reviewers never edit). Reports land under `reviews/<project>/plan/`.
+3. The parent triages findings with `receiving-code-review` discipline:
+   verify each claim independently, fix the packet, or reject the finding with
+   a rationale recorded in the ledger. Reviewer prose never auto-blocks a
+   packet; only a concrete, verified objection does.
+4. Optionally run `fusion_validate` over the full packet set as an
+   independent, advisory sanity check against the frozen contract.
+5. Re-review rule: a packet whose scope, interfaces, or file ownership changes
+   materially after review must be re-reviewed (or the change explicitly
+   approved) before dispatch.
+
+Only reviewed-and-approved packets are dispatched to Phase C.
 
 ### Phase C — Parallel implementation (worktree-isolated)
 Each subagent gets ONE packet derived from the approved architecture: one
