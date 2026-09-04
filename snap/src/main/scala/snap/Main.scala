@@ -125,22 +125,23 @@ object Main extends ZIOAppDefault {
   override def run: ZIO[Environment & ZIOAppArgs & Scope, Any, Any] =
     for {
       args <- ZIOAppArgs.getArgs
-      // Fix UTF-8 filename decoding under LANG=C before any filesystem access (F-utf8).
-      reexecExitCode <- ZIO.attemptBlocking(attemptJnuReexec(args))
-      _ <- reexecExitCode match {
-        case Some(code) => exit(ExitCode(code))
-        case None =>
-          for {
-            env <- ZIO.attempt(
-              cmdEnv(
-                getenv = name => Option(java.lang.System.getenv(name)),
-                cwd = Path.of("").toAbsolutePath,
-                isTty = java.lang.System.console() != null
-              )
-            )
-            code <- Commands.run(args, env, Commands.Output.live)
-            _ <- exit(ExitCode(code))
-          } yield ()
-      }
+      env <- ZIO.attempt(
+        cmdEnv(
+          getenv = name => Option(java.lang.System.getenv(name)),
+          cwd = Path.of("").toAbsolutePath,
+          isTty = java.lang.System.console() != null
+        )
+      )
+      code <- Commands.run(args, env, Commands.Output.live)
+      _ <-
+        if (code == Jnu.ReexecCode)
+          ZIO.attemptBlocking(attemptJnuReexec(args)).flatMap {
+            case Some(childCode) => exit(ExitCode(childCode))
+            case None =>
+              ZIO.attemptBlocking {
+                java.lang.System.err.print("snap: internal error\n")
+              } *> exit(ExitCode(2))
+          }
+        else exit(ExitCode(code))
     } yield ()
 }
