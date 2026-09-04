@@ -168,6 +168,12 @@ object HttpSpec extends ZIOSpecDefault {
             headers = Headers("Location", "/bad"),
             body = Body.empty
           )
+        case "/bad-utf8" =>
+          Response(
+            status = Status.Ok,
+            headers = jsonHeaders,
+            body = Body.fromArray(Array[Byte](0xff.toByte, 0xfe.toByte))
+          )
         case _ => Response.status(Status.NotFound)
       }
     }
@@ -331,6 +337,39 @@ object HttpSpec extends ZIOSpecDefault {
           // not, so the one-time JVM Unsafe deprecation WARNING lines are tolerated here.
           err.linesIterator.forall(l => l.startsWith("WARNING:") || l.isBlank)
         )
+      },
+      test("HEAD content-length equals GET body byte length with zero body bytes (E4-P2)") {
+        withSnapshotServer() { port =>
+          for {
+            getResp <- rawRequest(port, "GET /repository.json HTTP/1.1")
+            headResp <- rawRequest(port, "HEAD /repository.json HTTP/1.1")
+          } yield {
+            val getBodyLen = getResp.body.length
+            assertTrue(
+              getResp.status == 200,
+              headResp.status == 200,
+              headResp.header("content-type") == getResp.header("content-type"),
+              headResp.header("content-length").contains(getBodyLen.toString),
+              getResp.header("content-length").contains(getBodyLen.toString),
+              headResp.body.isEmpty
+            )
+          }
+        }
+      },
+      test("bind failure on occupied port surfaces as IoFailure, not defect (E4-P1)") {
+        for {
+          ss <- ZIO.attemptBlocking(
+            new java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"))
+          )
+          busyPort = ss.getLocalPort
+          port <- ZIO.fromEither(Model.Port.parse(busyPort.toString))
+          result <- ZIO.scoped(HttpServe.serve("{}", port).either)
+          _ <- ZIO.attemptBlocking(ss.close())
+        } yield assertTrue(
+          result.isLeft,
+          result.left.toOption.exists(_.isInstanceOf[SnapError.IoFailure]),
+          result.left.toOption.exists(_.detail.startsWith("failed to start HTTP server"))
+        )
       }
     ),
     suite("HttpFetch client")(
@@ -415,6 +454,17 @@ object HttpSpec extends ZIOSpecDefault {
           !HttpFetch.isHttpUrl("/abs/path"),
           !HttpFetch.isHttpUrl("file:///x")
         )
+      },
+      test("a non-UTF-8 body surfaces as InvalidJson (E4-P3)") {
+        val counter = new AtomicInteger(0)
+        withMockServer(mockRoutes(counter)) { port =>
+          for {
+            res <- HttpFetch.fetchRepository(urlOf(port, "/bad-utf8")).either
+          } yield assertTrue(
+            res == Left(SnapError.InvalidJson("HTTP response body is not valid UTF-8")),
+            counter.get() == 1
+          )
+        }
       }
     )
   ) @@ TestAspect.sequential @@ TestAspect.withLiveClock @@ TestAspect.timeout(120.seconds)

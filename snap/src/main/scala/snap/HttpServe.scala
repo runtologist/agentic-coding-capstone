@@ -15,7 +15,8 @@ import java.nio.charset.StandardCharsets
   *
   *   - `GET /repository.json` with no query → 200, `Content-Type: application/json; charset=utf-8`,
   *     body = snapshot;
-  *   - `HEAD /repository.json` with no query → 200, same headers, zero body bytes (ruling H);
+  *   - `HEAD /repository.json` with no query → 200, same headers as GET including Content-Length,
+  *     but zero body bytes (SPEC §9, ruling H);
   *   - any other method on that exact path without query → 405 + `Allow: GET, HEAD`;
   *   - any other path, or any query string on the resource path → 404.
   *
@@ -37,6 +38,7 @@ object HttpServe {
 
   /** Routes serving a single pre-serialized repository snapshot. */
   private[snap] def snapshotRoutes(body: String): Routes[Any, Response] = {
+    val bodyBytes = body.getBytes(StandardCharsets.UTF_8)
     val responder = handler { (_: Path, req: Request) =>
       val exactResource = req.url.path.encode == ResourcePath && req.url.queryParams.isEmpty
       if (!exactResource) Response.status(Status.NotFound)
@@ -46,10 +48,16 @@ object HttpServe {
             Response(
               status = Status.Ok,
               headers = JsonContentType,
-              body = Body.fromString(body, StandardCharsets.UTF_8)
+              body = Body.fromArray(bodyBytes)
             )
           case Method.HEAD =>
-            Response(status = Status.Ok, headers = JsonContentType, body = Body.empty)
+            // SPEC §9: HEAD returns the same status and headers as GET without a body. The
+            // explicit Content-Length mirrors the GET body length; zio-http preserves it.
+            Response(
+              status = Status.Ok,
+              headers = JsonContentType ++ Headers("Content-Length", bodyBytes.length.toString),
+              body = Body.empty
+            )
           case _ =>
             Response(status = Status.MethodNotAllowed, headers = AllowGetHead, body = Body.empty)
         }
@@ -59,14 +67,32 @@ object HttpServe {
 
   /** Install the snapshot server bound to `127.0.0.1` at `port` (0 → OS-assigned) in the ambient
     * scope and yield the actual bound port. The server keeps running until the scope closes.
+    *
+    * Bind failures (e.g. port already in use) surface inside zio-http as defects, so they are
+    * sandboxed and re-raised as [[SnapError.IoFailure]] — a typed, exit-1 error (E4-P1).
     */
-  def serve(body: String, port: Model.Port): ZIO[Scope, SnapError, Int] =
-    (for {
-      serverEnv <- Server.defaultWith(_.binding("127.0.0.1", port)).build
-      boundPort <- Server.install(snapshotRoutes(body)).provideEnvironment(serverEnv)
-    } yield boundPort).mapError(t =>
-      SnapError.IoFailure(s"failed to start HTTP server: ${messageOf(t)}")
-    )
+  def serve(body: String, port: Model.Port): ZIO[Scope, SnapError, Int] = {
+    val launch: ZIO[Scope, Throwable, Int] =
+      for {
+        serverEnv <- Server.defaultWith(_.binding("127.0.0.1", port)).build
+        boundPort <- Server.install(snapshotRoutes(body)).provideEnvironment(serverEnv)
+      } yield boundPort
+
+    launch
+      .mapError(t => SnapError.IoFailure(s"failed to start HTTP server: ${messageOf(t)}"))
+      .sandbox
+      .catchAll { cause =>
+        cause.failureOrCause match {
+          case Left(err) => ZIO.fail(err) // already a typed SnapError from mapError
+          case Right(defects) =>
+            if (defects.isInterruptedOnly) ZIO.refailCause(defects)
+            else
+              ZIO.fail(
+                SnapError.IoFailure(s"failed to start HTTP server: ${messageOf(defects.squash)}")
+              )
+        }
+      }
+  }
 
   /** Convenience for L7: serialize the repository once and serve that immutable snapshot. */
   def serveSnapshot(repo: Model.Repository, port: Model.Port): ZIO[Scope, SnapError, Int] =

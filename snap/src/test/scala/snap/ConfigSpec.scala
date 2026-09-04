@@ -209,6 +209,34 @@ object ConfigSpec extends ZIOSpecDefault {
       },
       test("no repo root and no home yields None") {
         Config.resolveContributor(None, None).map(res => assertTrue(res.isEmpty))
+      },
+      test("invalid UTF-8 bytes in local config fail with InvalidJson (E4-P3)") {
+        ZIO.scoped {
+          for {
+            base <- tempDir("bad-utf8-local")
+            repo = base.resolve("repo")
+            _ <- ZIO.attemptBlocking {
+              Files.createDirectories(Config.localConfigPath(repo).getParent)
+              Files.write(Config.localConfigPath(repo), Array[Byte](0xff.toByte, 0xfe.toByte))
+            }
+            res <- Config.resolveContributor(Some(repo), None).either
+          } yield assertTrue(
+            res == Left(SnapError.InvalidJson("config is not valid UTF-8"))
+          )
+        }
+      },
+      test("invalid UTF-8 bytes in global config fail with InvalidJson (E4-P3)") {
+        ZIO.scoped {
+          for {
+            home <- tempDir("bad-utf8-global")
+            _ <- ZIO.attemptBlocking(
+              Files.write(Config.globalConfigPath(home), Array[Byte](0xff.toByte, 0xfe.toByte))
+            )
+            res <- Config.resolveContributor(None, Some(home)).either
+          } yield assertTrue(
+            res == Left(SnapError.InvalidJson("config is not valid UTF-8"))
+          )
+        }
       }
     )
   )

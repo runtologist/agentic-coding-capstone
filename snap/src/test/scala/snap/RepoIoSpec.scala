@@ -247,6 +247,21 @@ object RepoIoSpec extends ZIOSpecDefault {
             after == before
           )
         }
+      },
+      test("invalid UTF-8 bytes in repository.json fail with InvalidJson (E4-P3)") {
+        ZIO.scoped {
+          for {
+            base <- tempDir("load-badutf8")
+            repo = base.resolve("repo")
+            _ <- RepoIo.init(repo)
+            _ <- ZIO.attemptBlocking(
+              Files.write(RepoIo.repoFile(repo), Array[Byte](0xff.toByte, 0xfe.toByte))
+            )
+            res <- RepoIo.loadRepository(repo).either
+          } yield assertTrue(
+            res == Left(SnapError.InvalidJson("repository is not valid UTF-8"))
+          )
+        }
       }
     ),
     suite("writeRepositoryAtomic")(
