@@ -160,6 +160,76 @@ object WorkingTreeSpec extends ZIOSpecDefault {
             res <- WorkingTree.scan(dir).either
           } yield assertTrue(res == Left(SnapError.UnsupportedEntry("alink")))
         }
+      },
+      test("a file with a backslash in its name fails scan with InvalidRepoPath (E5-F3)") {
+        ZIO.scoped {
+          for {
+            dir <- tempDir("backslash")
+            _ <- ZIO.attemptBlocking(writeText(dir.resolve("bad\\name.txt"), "x"))
+            res <- WorkingTree.scan(dir).either
+          } yield assertTrue(
+            res == Left(SnapError.InvalidRepoPath("bad\\name.txt", "contains a backslash"))
+          )
+        }
+      },
+      test("a file with a control character in its name fails scan with InvalidRepoPath (E5-F3)") {
+        ZIO.scoped {
+          for {
+            dir <- tempDir("controlchar")
+            _ <- ZIO.attemptBlocking(writeText(dir.resolve("bad\u0001name.txt"), "x"))
+            res <- WorkingTree.scan(dir).either
+          } yield assertTrue(
+            res == Left(
+              SnapError.InvalidRepoPath("bad\u0001name.txt", "contains a control character")
+            )
+          )
+        }
+      },
+      test(".snap is still skipped when path validation is active (E5-F3)") {
+        ZIO.scoped {
+          for {
+            dir <- tempDir("snap-skip-valid")
+            _ <- ZIO.attemptBlocking {
+              writeText(dir.resolve("good.txt"), "ok")
+              writeText(dir.resolve(".snap").resolve("repository.json"), "{}")
+              writeText(dir.resolve(".snap").resolve("weird\\path"), "{}")
+            }
+            tree <- WorkingTree.scan(dir)
+          } yield assertTrue(
+            Model.sortedPaths(tree) == Vector("good.txt"),
+            !tree.contains(".snap/repository.json")
+          )
+        }
+      },
+      test("valid unicode filenames still pass scan with path validation (E5-F3)") {
+        ZIO.scoped {
+          for {
+            dir <- tempDir("unicode-valid")
+            _ <- ZIO.attemptBlocking {
+              writeText(dir.resolve("caf\u00e9.txt"), "coffee")
+              writeText(dir.resolve("\u65e5\u672c\u8a9e").resolve("file.txt"), "nihongo")
+            }
+            tree <- WorkingTree.scan(dir)
+          } yield assertTrue(
+            tree.contains("caf\u00e9.txt"),
+            tree.contains("\u65e5\u672c\u8a9e/file.txt"),
+            tree.size == 2
+          )
+        }
+      },
+      test("first invalid path in sorted order wins over later ones (E5-F3)") {
+        ZIO.scoped {
+          for {
+            dir <- tempDir("first-invalid")
+            _ <- ZIO.attemptBlocking {
+              writeText(dir.resolve("zz\\bad"), "x")
+              writeText(dir.resolve("aa\\bad"), "y")
+            }
+            res <- WorkingTree.scan(dir).either
+          } yield assertTrue(
+            res == Left(SnapError.InvalidRepoPath("aa\\bad", "contains a backslash"))
+          )
+        }
       }
     ),
     suite("compare")(
