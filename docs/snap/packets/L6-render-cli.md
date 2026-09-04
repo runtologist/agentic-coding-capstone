@@ -15,7 +15,7 @@
 
 ## Cli.scala — argument grammar → Command ADT (CONTRACT §1; SPEC §7)
 
-`sealed trait Command` with cases: `Init(path: Option[String])`, `Config(global: Boolean, id: String)`, `Status`, `Log`, `Commit(message: String)`, `Diff(oldRaw: Option[String], newRaw: Option[String], repo: Option[String])`, `Revert(versionRaw: String)`, `Merge(repo: String)`, `Serve(port: Option[Port])`, `ShowVersion`.
+`sealed trait Command` with cases: `Init(path: Option[String])`, `Config(global: Boolean, id: String)`, `Status`, `Log`, `Commit(message: String)`, `Diff(oldRaw: Option[String], newRaw: Option[String], repo: Option[String])`, `Revert(versionRaw: String)`, `Merge(repo: String)`, `Serve(port: Port)`, `ShowVersion`. When `--serve` has no port operand, Cli resolves `Model.Port.default` (8765), so downstream code always receives a typed `Port`.
 
 Keep version operands as raw strings in the Command ADT; parsing to `Version` happens in the Commands layer so error ordering matches CONTRACT.md §13 (revert: unknown-version error precedes missing-contributor error).
 
@@ -30,7 +30,7 @@ Grammar rules — every violation returns `Left(SnapError.InvalidCommandOrArgume
 - `diff` valid forms: no args | `<old> <new>` | `<old> <new> --repo <repository>`; `--repo` only after both version operands, at most once, value required. Exactly one version operand → DiffUsage; unknown option or extra token in diff → DiffUsage (tests 14/24 pin `^snap: usage: snap diff .+\n$`)
 - `revert <version>` — exactly one operand
 - `merge <repository>` — exactly one operand
-- `--serve [port]` — port optional; when present validate via `Port.parse` (all-digit, 0..=65535; else `InvalidPort(raw)` rendering `invalid port: <raw>` — test 14 pins `snap: invalid port: 65536`). `--serve 0 extra` → invalid command or arguments
+- `--serve [port]` — port optional (absent → `Model.Port.default`); when present validate via `Port.parse` (all-digit, no leading zeros except bare `0`, 0..=65535; else `InvalidPort(raw)` rendering `invalid port: <raw>` — test 14 pins `snap: invalid port: 65536`). `--serve 0 extra` → invalid command or arguments
 - Parsing is pure: grammar errors must imply no side effects (test 24 asserts e.g. no `--unknown` file/dir created)
 
 Pin every row of the test-24 grammar matrix in CliSpec:
@@ -48,10 +48,10 @@ Pin every row of the test-24 grammar matrix in CliSpec:
 Unit-test all four TTY combinations (stdout/stderr independently) with injected booleans (SPEC §11 mandates this since the harness has no PTY).
 
 Plain mode (byte-stable):
-- init success: `()\n`; commit/revert success: `<version>\n`; merge success: `<joined version>\n`
+- init success: `()\n`; commit/revert success: `<version>\n`; merge success: `<joined version>\n`; `--version`: `snap 1.0.0\n`
 - status: `version <v>\n` then one line per change `<A|M|D> <path>\n`, rows sorted by unsigned UTF-8 path; clean repo prints only the version line
-- log: one line per patch, reverse canonical integration order: `<result-version>\t<author>\t<escaped-message>\n`; escaping order is `\`→`\\` FIRST, then TAB→`\t`, then LF→`\n` (test 04 golden: raw message `first<TAB>line<LF>second<\>tail` renders `first\tline\nsecond\\tail`)
-- diff blocks:
+- log: one line per patch, reverse canonical integration order: `<result-version>\t<author>\t<escaped-message>\n`; escaping order is `\`→`\\` FIRST, then TAB→`\t`, then LF→`\n`; trailing spaces in the message are preserved inside the bold wrap in terminal mode (test 28) (test 04 golden: raw message `first<TAB>line<LF>second<\>tail` renders `first\tline\nsecond\\tail`)
+- diff blocks: blocks for multiple changed paths are emitted sorted by unsigned-UTF-8 path order (test 05 golden shows `added.txt` before `repeated.txt`)
   - headers `--- a/<path>` / `+++ b/<path>`; absent side uses `/dev/null` without `a/`/`b/` prefix
   - hunk header always `@@ -1,<old-token-count> +1,<new-token-count> @@`
   - body lines: retained ` <token>`, deleted `-<token>`, inserted `+<token>` (print token without its trailing LF, if any)
@@ -75,6 +75,6 @@ Presentation MUST NOT change command execution, repository/filesystem effects, w
 
 ## Definition of done
 1. Gates green: `source ../scripts/env.sh && cd snap && sbt --client shutdown; sbt --client "compile; test; scalafmtCheckAll"` then `sbt --client shutdown`.
-2. ≥40 new focused tests across CliSpec/RenderSpec: full grammar matrix from test 24, all four TTY/presentation combinations, exact ANSI goldens from test 28, plain-mode goldens from tests 04/05/06 (render side only).
+2. ≥40 new focused tests across CliSpec/RenderSpec: full grammar matrix from test 24; all four TTY/presentation combinations; explicit resolver branch tests (invalid `SNAP_COLOR` → `InvalidSnapColor`; `NO_COLOR` present with any value including empty forces plain in auto; `always` overrides `NO_COLOR`); exact ANSI goldens quoted verbatim from test 28; plain-mode goldens from tests 04/05/06 (render side only).
 3. Commit on branch, push: `git push -u origin task/04-render-cli`. No Co-Authored-By trailers.
 4. Report: files changed, test counts, gate tails, deviations (with justification), risks.
