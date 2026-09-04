@@ -4,7 +4,6 @@ import zio.*
 import zio.http.*
 
 import java.net.MalformedURLException
-import java.nio.charset.StandardCharsets
 
 /** HTTP repository fetch (SPEC §9; CONTRACT §12).
   *
@@ -33,7 +32,10 @@ object HttpFetch {
           .when(response.status != Status.Ok)(
             ZIO.fail(HttpStatusException(response.status.code))
           )
-        body <- response.body.asString(StandardCharsets.UTF_8)
+        bodyBytes <- response.body.asArray
+        body <- ZIO
+          .fromOption(Model.decodeUtf8(bodyBytes))
+          .orElseFail(SnapError.InvalidJson("HTTP response body is not valid UTF-8"))
         repo <- ZIO.fromEither(Json.parseRepository(body))
         _ <- ZIO.fromEither(Codec.validateRepository(repo))
       } yield repo
