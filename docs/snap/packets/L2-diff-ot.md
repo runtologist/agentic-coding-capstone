@@ -51,12 +51,14 @@ Continue until both streams end (both consume the same base token count; trailin
    - split counts + insert priority + trailing insert → `A\n0\nB\n3\n4\nTAIL\n`
    - P-retain vs Q-delete → `0\n2\n3\n4\nA\n`
    - Q-insert before P-delete survives → `0\nB\n2\n3\n4\n`
-   Derive exact P/Q scripts from harness/snap/tests/22-ot-matrix.yaml and assert transform output + applied result byte-exact.
-3. Test 18 three-way: base ["start\n","end\n"]; a inserts "A\n" after start, b inserts "B\n" after start, c deletes "start\n". Verify convergence: canonical order c→b→a yields final "B\nA\nend\n" with NO warnings (replay integration is L3's job, but Ot.transform must support it — add a property-style unit test applying transforms pairwise).
-4. Property tests: for random small token vectors, apply(old, canonicalDiff(old,new)) == new; canonicalDiff output always canonical (no adjacent same-kind, counts positive, insert tokens valid per Model.isValidInsertToken).
+   Derive exact P/Q scripts from harness/snap/tests/22-ot-matrix.yaml; assert the EXACT transformed op sequence, and assert the applied result text byte-exact.
+3. Test 18 three-way: base ["start\n","end\n"]; a inserts "A\n" after start, b inserts "B\n" after start, c deletes "start\n". Verify convergence: canonical order c→b→a yields final "B\nA\nend\n" with NO warnings (replay integration is L3's job, but Ot.transform must support it — add explicit pairwise transform tests for the three pairs a×b, a×c, b×c asserting each transformed edit applies to the context and converges on "B\nA\nend\n" when integrated in canonical order).
+4. Property tests: for random small token vectors, apply(old, canonicalDiff(old,new)) == new; canonicalDiff output always canonical (no adjacent same-kind per Model.hasAdjacentSameKind, counts positive, insert tokens valid per Model.isValidInsertToken).
+
+Test-first requirement: write each failing spec first, observe it fail, then implement; commit tests together with (or before) the implementation so the red→green sequence is auditable.
 
 ## Definition of done
-1. Gates green: `source ../scripts/env.sh && cd snap && sbt --client shutdown; sbt --client "compile; test; scalafmtCheckAll"` then `sbt --client shutdown`.
+1. Gates green: `source ../scripts/env.sh && cd snap && sbt --client shutdown; sbt --client "compile; test; assembly; scalafmtCheckAll"` then `sbt --client shutdown` (assembly included to catch packaging regressions early).
 2. ≥30 new focused tests across DiffSpec/OtSpec, all meaningful assertions.
 3. Commit on branch, push: `git push -u origin task/03-diff-ot`. No Co-Authored-By trailers.
 4. Report: files, test counts, gate tails, deviations, risks.
