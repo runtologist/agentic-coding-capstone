@@ -18,6 +18,25 @@ Revision 2026-09-05 (post human review):
   YAML harness (every case asserts exit code + exact stdout/stderr at process
   level), plus `CliSpec`/`RenderSpec` unit tests.
 
+Revision 2026-09-05 #2 (user direction — simplify JSON layer):
+- `Json.scala` must add **as little as possible on top of zio-json**. Remove the
+  internal JSON model (`type Value = ZJson`, `obj`/`arr`/`str`/`num`/`bool`
+  constructors, and the generic `asObject`/`asArray`/`field` extraction
+  helpers). Decode repository/config JSON **directly into Model types**
+  (`Repository`, `Patch`, `Change`, `EditOp`, `Version`) via zio-json
+  `JsonDecoder`/`JsonEncoder` instances.
+- The guide is passing **all validations of the repository format** (SPEC §4.5
+  and the pinned error substrings in CONTRACT §7); anything zio-json already
+  provides must not be re-implemented.
+- Custom code is allowed only where zio-json cannot express the pinned
+  contract: duplicate-key rejection **with the offending key name**, config-file
+  trailing-byte tolerance, integer-literal strictness, unknown-field detection
+  with field name, and the Node-`JSON.stringify(v,null,2)+"\n"` byte-exact
+  canonical writer.
+- Delivered as a **parallel Wave 2 lane (J1)** so it does not slow overall
+  progress; J1 owns `Json.scala` + `JsonSpec.scala` only and must merge before
+  L3 (Codec) starts.
+
 ## Delivery shape
 
 A **process-level CLI** (`snap`): every invocation is a fresh JVM process that
@@ -46,9 +65,9 @@ Tests in `snap/src/test/scala/snap/` (zio-test).
 | Module | File(s) | Responsibility | Purity |
 |---|---|---|---|
 | Errors | `SnapError.scala` | Sealed error ADT; one case per distinct failure with typed fields; every expected failure renders its exact `snap: <detail>` message; internal failures separate (exit 2) | pure |
-| Json | `Json.scala` | zio-json-based parsing to `zio.json.ast.Json` AST with duplicate-key detection, exact integer-literal validation, trailing-tolerance flag for config files; canonical 2-space pretty writer matching `JSON.stringify(v,null,2)+"\n"` byte-for-byte | pure |
+| Json | `Json.scala` | Thin zio-json codec layer: `JsonDecoder`/`JsonEncoder` instances mapping repository/config JSON directly onto Model types (no internal JSON model); keeps only contract-forced checks — duplicate-key rejection with key name, config trailing-byte tolerance, integer-literal strictness, unknown-field detection, and the Node-`JSON.stringify(v,null,2)+"\n"` byte-exact canonical writer | pure |
 | Model | `Model.scala` | `ContributorId`, `Revision`, `Port`, `Version` (parse/render/compare/join/snapOrder), `EditOp`, `Change` (Text/Put/Delete), `Patch` (dot, result), `Repository`, `Tree` (`SortedMap[String, Array[Byte]]` with UTF-8 byte-order keys), text/token classification | pure |
-| Codec | `Codec.scala` | JSON ↔ Model for repository/config with full §4.5 schema validation: unknown fields, canonical base64, safe integers, message rules, edit-op shape, path validity, sorting, closure, contiguity, cycles, change-vs-base checks, replay validation | pure |
+| Codec | `Codec.scala` | Semantic repository/config validation over decoded Model values (full §4.5): canonical base64, safe integers, message rules, edit-op shape, path validity, sorting, closure, contiguity, cycles, change-vs-base checks, replay validation; delegates structural JSON decode/encode to `Json` | pure |
 | Diff | `Diff.scala` | §5 canonical token diff (DP, delete-on-tie, coalesce) → `Vector[EditOp]`; edit-script application; token canonicality checks | pure |
 | Ot | `Ot.scala` | §6.3 transform(P, Q) with count splitting, Q-insert priority, trailing inserts, coalesce | pure |
 | Replay | `Replay.scala` | §6.1 canonical integration order; §6.2 patch integration (namespace resolution, per-path rules 1–4); §6.4 winner rules + `ReplayWarning` ADT; `materialize(patches, version): (Tree, Vector[ReplayWarning])` | pure |
@@ -197,14 +216,17 @@ arguments and JSON decoding), never assumed downstream.
   HTTP client and server (per user direction); zio-test for unit tests. All
   side effects live in ZIO effects and map into the sealed error ADT (memory
   `idiomatic-zio-patterns`).
-- **JSON via zio-json**: decode into `zio.json.ast.Json` so we keep control of
-  duplicate-key detection, integer-literal exactness (`1.5` → "positive safe
-  integer" error), and config-only trailing-byte tolerance; write via our own
-  canonical 2-space pretty writer byte-compatible with
-  `JSON.stringify(v, null, 2)+"\n"` (needed for `--serve` snapshot exactness).
-  Spike: confirm zio-json exposes duplicate-key detection and how it reports
-  trailing content; if a gap exists, keep zio-json as the parser and add a thin
-  targeted check around it. The harness-visible contract does not change.
+- **JSON via zio-json — thin layer, no internal model**: define zio-json
+  `JsonDecoder`/`JsonEncoder` instances that decode repository/config JSON
+  directly into Model types. Keep only what the pinned contract forces:
+  duplicate-key rejection surfacing the key name (AST pre-pass if typed
+  decoding cannot), config-only trailing-byte tolerance (CONTRACT §15 ruling A),
+  integer-literal strictness (`1.5` → "positive safe integer"), unknown-field
+  detection with field names, and the Node-`JSON.stringify(v, null, 2)+"\n"`
+  byte-exact canonical writer (use zio-json's pretty printer only if empirically
+  byte-identical; otherwise a minimal writer over Model values). J1 spike
+  confirms zio-json behavior before deleting the current AST helpers. The
+  harness-visible contract does not change.
 - **HTTP via zio-http**: server bound to `127.0.0.1` serving one immutable
   snapshot resource with exact status/header control (`Content-Type:
   application/json; charset=utf-8`, 404 for non-matching targets including
@@ -228,17 +250,20 @@ arguments and JSON decoding), never assumed downstream.
 | Lane | Production files (exclusive) | Test files (exclusive) |
 |---|---|---|
 | L1 model+errors | `Model.scala`, `SnapError.scala` | `ModelSpec.scala`, `SnapErrorSpec.scala` |
-| L2 json+diff+ot | `Json.scala`, `Diff.scala`, `Ot.scala` | `JsonSpec.scala`, `DiffSpec.scala`, `OtSpec.scala` |
+| L2 diff+ot | `Diff.scala`, `Ot.scala` | `DiffSpec.scala`, `OtSpec.scala` |
+| J1 json-thin | `Json.scala` | `JsonSpec.scala` |
 | L3 codec+replay | `Codec.scala`, `Replay.scala` | `CodecSpec.scala`, `ReplaySpec.scala` |
 | L4 tree+io | `WorkingTree.scala`, `RepoIo.scala`, `Config.scala` | `WorkingTreeSpec.scala`, `RepoIoSpec.scala`, `ConfigSpec.scala` |
 | L5 http | `HttpFetch.scala`, `HttpServe.scala` | `HttpSpec.scala` |
 | L6 render+cli | `Render.scala`, `Cli.scala` | `RenderSpec.scala`, `CliSpec.scala` |
 | L7 commands+main | `Commands.scala`, `Main.scala` | `CommandsSpec.scala`, `MainSpec.scala` |
 
-Dependency order: L1 → (L2, L6) → L3 → (L4, L5) → L7. L1 is complete
-(commit `14be7c4`) but `Json.scala` is rewritten in L2 for zio-json and
-`SnapError.scala` gains the refined validation cases. L2∥L6 run as parallel
-worktree lanes; L4∥L5 likewise; L3 and L7 are sequential.
+Dependency order: L1 → Wave 2: (L2 diff+ot ∥ L6 render+cli ∥ J1 json-thin) →
+L3 codec+replay → (L4, L5) → L7. L1 is complete (commits `b9edba3` +
+`7356468`); J1 rewrites `Json.scala` into the thin zio-json codec layer and
+runs in parallel with L2 and L6 because none of them share files. L3 consumes
+the simplified `Json` interface, so it starts after J1 merges. L2∥L6∥J1 run as
+parallel worktree lanes; L4∥L5 likewise; L3 and L7 are sequential.
 
 ## Verification plan
 
@@ -274,9 +299,10 @@ worktree lanes; L4∥L5 likewise; L3 and L7 are sequential.
    compatible: per-line array elements, `"key": value` spacing, empty
    containers inline, minimal string escaping, trailing LF) — custom writer
    over zio-json AST, golden-tested.
-4. **zio-json exactness**: duplicate-key detection with key name, integer-
-   literal strictness (`1.5`, `1.0`, `1e2`), and trailing-content behavior for
-   config files — spike before L2/L3; thin wrapper checks fill any gaps.
+4. **zio-json exactness (J1 spike)**: duplicate-key detection with key name,
+   integer-literal strictness (`1.5`, `1.0`, `1e2`), trailing-content behavior
+   for config files, and unknown-field reporting — spike first in J1; keep the
+   thinnest possible wrapper checks around zio-json to fill gaps.
 5. **zio-http wire exactness**: confirm exact header casing/values, 405/404
    behavior, HEAD zero-body, redirect-off client, and Netty assembly merge;
    fall back to JDK HTTP behind the same ZIO interface only if zio-http cannot
@@ -305,3 +331,4 @@ worktree lanes; L4∥L5 likewise; L3 and L7 are sequential.
 | 2026-09-05 | `Version.join` remains total (`Version`, not `Either`) | Componentwise max of two valid versions is always valid; invalid input is rejected at parse boundaries. |
 | 2026-09-05 | `Replay.Warning` is a sealed enum (DeleteWins/LaterCreateWins/LaterPutWins/NamespaceWins/PutWins), not a String pair | User direction; rendering derives `auto-resolved <path>: <reason>`. |
 | 2026-09-05 | Exit-code and console-output validation relies on the supplied YAML harness plus Cli/Render unit tests | User question answered: the 28-case harness is a process-level integration suite asserting exit codes and exact stdout/stderr. |
+| 2026-09-05 | Simplify `Json.scala` to a thin zio-json codec layer with no internal JSON model; decode directly into Model types; run as parallel Wave 2 lane J1 | User direction: add as little as possible on top of zio-json, guided by passing all repository-format validations, without slowing overall progress. |

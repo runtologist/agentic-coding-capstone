@@ -1,316 +1,682 @@
 package snap
 
-/** Minimal strict JSON layer for Snap.
+import zio.json.*
+import zio.json.ast.{Json => ZJson}
+
+import java.math.{BigDecimal => JBigDecimal}
+
+/** Thin JSON codec layer for Snap built directly on zio-json (SPEC §4).
   *
-  * Parsing:
-  *   - full RFC 8259 grammar (objects, arrays, strings with \u escapes, numbers, literals)
-  *   - duplicate object keys are rejected (SPEC §4.1 "Valid input has unique object keys")
-  *   - trailing content after the top-level value is rejected in strict mode but tolerated in
-  *     lenient mode (config files only — see docs/snap/CONTRACT.md §15 ruling A)
-  *   - numbers keep their raw literal so integer-literal exactness can be enforced later
+  * Design (ARCHITECTURE.md revision 2026-09-05 #2 — user direction): there is no Snap-owned JSON
+  * model. Input is decoded with zio-json into `zio.json.ast.Json` and converted straight into
+  * [[Model]] types. Only the contract-forced behavior is hand-rolled:
   *
-  * Writing:
-  *   - `renderPretty` reproduces Node's `JSON.stringify(value, null, 2)` plus a trailing LF, which
-  *     the `--serve` snapshot test pins byte-for-byte.
+  *   - duplicate object keys are rejected with the offending key name (SPEC §4.1);
+  *   - repository parsing rejects trailing bytes after the first value, config parsing tolerates
+  *     them (CONTRACT §15 ruling A);
+  *   - integer fields are validated as positive safe integers (SPEC §3.1/§4.4);
+  *   - unknown object fields are rejected per level (SPEC §4.1);
+  *   - `writeRepository`/`writeConfig` emit bytes identical to Node `JSON.stringify(v, null, 2)`
+  *     plus a trailing LF (pinned by test 12).
+  *
+  * Structural schema checks live here; semantic history validation (closure, ordering, cycles,
+  * change-vs-base replay) belongs to Codec/Replay (SPEC §4.5 steps 2–6).
   */
 object Json {
 
-  // ---------------------------------------------------------------------------
-  // AST
-  // ---------------------------------------------------------------------------
+  /** Minimal configuration document shape: `{"contributor":{"id":"<id>"}}` (SPEC §8). */
+  final case class ConfigFile(id: Model.ContributorId)
 
-  sealed trait Value
+  private type Fields = Vector[(String, ZJson)]
 
-  case object JNull extends Value
-  final case class JBool(value: Boolean) extends Value
-
-  /** A JSON number keeping its raw literal so callers can distinguish `1` from `1.5`/`1e2`. */
-  final case class JNum(raw: String) extends Value {
-    def isIntegralLiteral: Boolean = JNum.Integral.matches(raw)
-    def asLong: Option[Long] =
-      if (isIntegralLiteral) scala.util.Try(raw.toLong).toOption else None
-  }
-  object JNum {
-    private val Integral = "^-?(?:0|[1-9][0-9]*)$".r
-    def of(n: Long): JNum = JNum(n.toString)
-  }
-
-  final case class JStr(value: String) extends Value
-  final case class JArr(items: Vector[Value]) extends Value
-  final case class JObj(entries: Vector[(String, Value)]) extends Value {
-    def get(key: String): Option[Value] = entries.find(_._1 == key).map(_._2)
-    def keys: Vector[String] = entries.map(_._1)
-  }
+  private val RepoFields: Set[String] = Set("format", "frontier", "patches")
+  private val PatchFields: Set[String] = Set("author", "revision", "base", "message", "changes")
+  private val TextFields: Set[String] = Set("type", "path", "edit")
+  private val PutFields: Set[String] = Set("type", "path", "content")
+  private val DeleteFields: Set[String] = Set("type", "path")
+  private val ConfigFields: Set[String] = Set("contributor")
+  private val ContribFields: Set[String] = Set("id")
 
   // ---------------------------------------------------------------------------
-  // Parsing
+  // Parsing entry points
   // ---------------------------------------------------------------------------
 
-  /** Parse one JSON document.
-    *
-    * @param source
-    *   label used in error messages (e.g. file path or "response body")
-    * @param allowTrailing
-    *   when true, bytes after the first complete value are ignored
+  /** Parse one complete repository document strictly (SPEC §4.1). Malformed JSON, duplicate keys,
+    * unknown fields, trailing content, and invalid typed values are errors.
     */
-  def parse(
-      input: String,
-      source: String,
-      allowTrailing: Boolean = false
-  ): Either[SnapError, Value] =
-    new Parser(input, source, allowTrailing).run()
-
-  private final class Malformed(val reason: String) extends RuntimeException
-
-  private final class Parser(input: String, source: String, allowTrailing: Boolean) {
-    private var pos = 0
-
-    def run(): Either[SnapError, Value] =
-      try {
-        skipWs()
-        val v = parseValue()
-        skipWs()
-        if (!allowTrailing && pos < input.length)
-          throw new Malformed(s"trailing content at offset $pos")
-        Right(v)
-      } catch {
-        case m: Malformed    => Left(SnapError.InvalidJson(s"$source: ${m.reason}"))
-        case d: DuplicateKey => Left(SnapError.DuplicateJsonKey(d.key))
-      }
-
-    private def fail(reason: String): Nothing = throw new Malformed(reason)
-
-    private def peek: Char =
-      if (pos < input.length) input.charAt(pos) else fail("unexpected end of input")
-
-    private def peekOpt: Option[Char] =
-      if (pos < input.length) Some(input.charAt(pos)) else None
-
-    private def advance(): Char = {
-      val c = peek
-      pos += 1
-      c
-    }
-
-    private def skipWs(): Unit =
-      while (pos < input.length) {
-        val c = input.charAt(pos)
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') pos += 1
-        else return
-      }
-
-    private def expect(c: Char): Unit =
-      if (pos >= input.length || input.charAt(pos) != c)
-        fail(s"expected '$c' at offset $pos")
-      else pos += 1
-
-    private def parseValue(): Value =
-      peek match {
-        case '{'                        => parseObject()
-        case '['                        => parseArray()
-        case '"'                        => JStr(parseString())
-        case 't'                        => parseLiteral("true", JBool(true))
-        case 'f'                        => parseLiteral("false", JBool(false))
-        case 'n'                        => parseLiteral("null", JNull)
-        case c if c == '-' || c.isDigit => parseNumber()
-        case c                          => fail(s"unexpected character '$c' at offset $pos")
-      }
-
-    private def parseLiteral(text: String, value: Value): Value = {
-      if (input.regionMatches(pos, text, 0, text.length)) {
-        pos += text.length
-        value
-      } else fail(s"invalid literal at offset $pos")
-    }
-
-    private def parseObject(): Value = {
-      expect('{')
-      skipWs()
-      val entries = Vector.newBuilder[(String, Value)]
-      val seen = scala.collection.mutable.HashSet.empty[String]
-      if (peekOpt.contains('}')) {
-        pos += 1
-        return JObj(entries.result())
-      }
-      var continue = true
-      while (continue) {
-        skipWs()
-        if (!peekOpt.contains('"')) fail(s"expected object key at offset $pos")
-        val key = parseString()
-        if (!seen.add(key)) throw DuplicateKey(key)
-        skipWs()
-        expect(':')
-        skipWs()
-        val value = parseValue()
-        entries += ((key, value))
-        skipWs()
-        peekOpt match {
-          case Some(',') => pos += 1
-          case Some('}') => pos += 1; continue = false
-          case _         => fail(s"expected ',' or '}' at offset $pos")
+  def parseRepository(input: String): Either[SnapError, Model.Repository] =
+    input.fromJson[ZJson] match {
+      case Left(err) => Left(SnapError.InvalidJson(err))
+      case Right(ast) =>
+        firstValueEnd(input) match {
+          case Some(end) if isBlankAfter(input, end) => repositoryFromAst(ast)
+          case Some(_) =>
+            Left(SnapError.InvalidJson("trailing content after JSON value"))
+          case None =>
+            Left(SnapError.InvalidJson("unable to locate end of JSON value"))
         }
-      }
-      JObj(entries.result())
     }
 
-    private final case class DuplicateKey(key: String) extends RuntimeException
-
-    private def parseArray(): Value = {
-      expect('[')
-      skipWs()
-      val items = Vector.newBuilder[Value]
-      if (peekOpt.contains(']')) {
-        pos += 1
-        return JArr(items.result())
-      }
-      var continue = true
-      while (continue) {
-        skipWs()
-        items += parseValue()
-        skipWs()
-        peekOpt match {
-          case Some(',') => pos += 1
-          case Some(']') => pos += 1; continue = false
-          case _         => fail(s"expected ',' or ']' at offset $pos")
-        }
-      }
-      JArr(items.result())
+  /** Parse a configuration document (SPEC §8, CONTRACT §15 ruling A). Same strictness as
+    * [[parseRepository]] except bytes after the first complete JSON value are tolerated.
+    */
+  def parseConfig(input: String): Either[SnapError, ConfigFile] =
+    input.fromJson[ZJson] match {
+      case Left(err)  => Left(SnapError.InvalidJson(err))
+      case Right(ast) => configFileFromAst(ast)
     }
-
-    private def parseString(): String = {
-      expect('"')
-      val sb = new StringBuilder
-      var done = false
-      while (!done) {
-        if (pos >= input.length) fail("unterminated string")
-        val c = input.charAt(pos)
-        pos += 1
-        if (c == '"') done = true
-        else if (c == '\\') {
-          if (pos >= input.length) fail("unterminated escape")
-          val esc = input.charAt(pos)
-          pos += 1
-          esc match {
-            case '"'  => sb.append('"')
-            case '\\' => sb.append('\\')
-            case '/'  => sb.append('/')
-            case 'b'  => sb.append('\b')
-            case 'f'  => sb.append('\f')
-            case 'n'  => sb.append('\n')
-            case 'r'  => sb.append('\r')
-            case 't'  => sb.append('\t')
-            case 'u' =>
-              if (pos + 4 > input.length) fail("truncated \\u escape")
-              val hex = input.substring(pos, pos + 4)
-              if (
-                !hex.forall(h =>
-                  (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F')
-                )
-              )
-                fail(s"invalid \\u escape at offset $pos")
-              sb.append(Integer.parseInt(hex, 16).toChar)
-              pos += 4
-            case other => fail(s"invalid escape '\\$other' at offset ${pos - 1}")
-          }
-        } else if (c < 0x20) {
-          fail(s"unescaped control character in string at offset ${pos - 1}")
-        } else {
-          sb.append(c)
-        }
-      }
-      sb.result()
-    }
-
-    private def parseNumber(): Value = {
-      val start = pos
-      if (peekOpt.contains('-')) pos += 1
-      // integer part: 0 or [1-9][0-9]*
-      peekOpt match {
-        case Some('0') =>
-          pos += 1
-          peekOpt match {
-            case Some(d) if d.isDigit => fail(s"invalid number with leading zero at offset $start")
-            case _                    => ()
-          }
-        case Some(d) if d.isDigit =>
-          while (peekOpt.exists(_.isDigit)) pos += 1
-        case _ => fail(s"invalid number at offset $start")
-      }
-      // fraction
-      if (peekOpt.contains('.')) {
-        pos += 1
-        if (!peekOpt.exists(_.isDigit)) fail(s"invalid number fraction at offset $start")
-        while (peekOpt.exists(_.isDigit)) pos += 1
-      }
-      // exponent
-      if (peekOpt.exists(c => c == 'e' || c == 'E')) {
-        pos += 1
-        if (peekOpt.exists(c => c == '+' || c == '-')) pos += 1
-        if (!peekOpt.exists(_.isDigit)) fail(s"invalid number exponent at offset $start")
-        while (peekOpt.exists(_.isDigit)) pos += 1
-      }
-      JNum(input.substring(start, pos))
-    }
-  }
 
   // ---------------------------------------------------------------------------
-  // Writing (Node JSON.stringify(value, null, 2) compatible)
+  // Writing entry points
   // ---------------------------------------------------------------------------
 
-  /** Render with two-space indentation, Node-style, plus a trailing LF. */
-  def renderPretty(v: Value): String = {
-    val sb = new StringBuilder
-    writeValue(sb, v, 0)
-    sb.append('\n')
+  /** Serialize a repository byte-identically to Node `JSON.stringify(value, null, 2)` + "\n", with
+    * canonical field order (SPEC §4.1; test 12 pins the served snapshot bytes).
+    */
+  def writeRepository(repo: Model.Repository): String = {
+    val sb = new StringBuilder(256)
+    sb.append("{\n")
+    pad(sb, 1); sb.append("\"format\": 1,\n")
+    pad(sb, 1); sb.append("\"frontier\": "); writeVersion(sb, repo.frontier, 1); sb.append(",\n")
+    pad(sb, 1); sb.append("\"patches\": "); writePatches(sb, repo.patches, 1); sb.append('\n')
+    sb.append("}\n")
     sb.result()
   }
 
-  private def pad(sb: StringBuilder, indent: Int): Unit = {
+  /** Serialize config as `{"contributor":{"id":"<id>"}}` (two-space indent + trailing LF). */
+  def writeConfig(cfg: ConfigFile): String = {
+    val sb = new StringBuilder(64)
+    sb.append("{\n")
+    pad(sb, 1); sb.append("\"contributor\": {\n")
+    pad(sb, 2); sb.append("\"id\": "); writeString(sb, cfg.id.value); sb.append('\n')
+    pad(sb, 1); sb.append("}\n")
+    sb.append("}\n")
+    sb.result()
+  }
+
+  // ---------------------------------------------------------------------------
+  // AST -> Model conversion (repository)
+  // ---------------------------------------------------------------------------
+
+  private def repositoryFromAst(ast: ZJson): Either[SnapError, Model.Repository] =
+    ast match {
+      case obj: ZJson.Obj =>
+        for {
+          fields <- objectFields(obj)
+          _ <- findUnknown(fields, RepoFields) match {
+            case Some(k) => Left(SnapError.UnknownRepoField(k))
+            case None    => Right(())
+          }
+          _ <- requireFormat(fields)
+          frontier <- requiredArray(fields, "frontier", "repository")
+            .flatMap(versionFromPairs(_, "frontier"))
+          patches <- requiredArray(fields, "patches", "repository").flatMap { arr =>
+            seqEither(arr.elements.toVector.map(patchFromAst))
+          }
+        } yield Model.Repository(frontier, patches)
+      case _ => Left(SnapError.InvalidJson("repository must be a JSON object"))
+    }
+
+  private def requireFormat(fields: Fields): Either[SnapError, Unit] =
+    find(fields, "format") match {
+      case None =>
+        Left(SnapError.InvalidJson("repository: missing field 'format'"))
+      case Some(ZJson.Num(n)) if n.compareTo(JBigDecimal.ONE) == 0 => Right(())
+      case Some(_) =>
+        Left(SnapError.InvalidJson("repository: format must be the integer 1"))
+    }
+
+  private def versionFromPairs(arr: ZJson.Arr, what: String): Either[SnapError, Model.Version] =
+    seqEither(arr.elements.toVector.map(pairsFromAst(_, what))).flatMap { ps =>
+      Model.Version.fromPairs(ps, what)
+    }
+
+  private def pairsFromAst(ast: ZJson, what: String): Either[SnapError, (String, Long)] =
+    ast match {
+      case ZJson.Arr(items) if items.length == 2 =>
+        (items(0), items(1)) match {
+          case (ZJson.Str(id), ZJson.Num(rev)) =>
+            Model.positiveSafeInteger(rev, s"$what revision").map(r => (id, r))
+          case _ =>
+            Left(
+              SnapError.InvalidVersion(s"$what entries must be two-element [id, revision] pairs")
+            )
+        }
+      case _ =>
+        Left(SnapError.InvalidVersion(s"$what entries must be two-element [id, revision] pairs"))
+    }
+
+  private def patchFromAst(ast: ZJson): Either[SnapError, Model.Patch] =
+    ast match {
+      case obj: ZJson.Obj =>
+        objectFields(obj).flatMap { fields =>
+          findUnknown(fields, PatchFields) match {
+            case Some(k) =>
+              val authorCtx =
+                find(fields, "author").collect { case ZJson.Str(s) => s }.getOrElse("?")
+              val revCtx =
+                find(fields, "revision").collect { case ZJson.Num(n) => n.longValue }.getOrElse(0L)
+              Left(SnapError.UnknownPatchField(k, authorCtx, revCtx))
+            case None =>
+              for {
+                authorStr <- requiredString(fields, "author", "patch")
+                author <- Model.ContributorId.parse(authorStr)
+                revBd <- requiredNumber(fields, "revision", "patch")
+                revision <- Model.positiveSafeInteger(revBd, "patch revision")
+                baseArr <- requiredArray(fields, "base", "patch")
+                base <- versionFromPairs(baseArr, "base")
+                message <- requiredString(fields, "message", "patch")
+                _ <- Model.validateStoredMessage(message)
+                chArr <- requiredArray(fields, "changes", "patch")
+                _ <-
+                  if (chArr.elements.isEmpty) Left(SnapError.EmptyField("patch", "changes"))
+                  else Right(())
+                changes <- seqEither(
+                  chArr.elements.toVector.map(changeFromAst(_, author, revision))
+                )
+              } yield Model.Patch(author, revision, base, message, changes)
+          }
+        }
+      case _ => Left(SnapError.InvalidJson("patch must be a JSON object"))
+    }
+
+  private def changeFromAst(
+      ast: ZJson,
+      author: Model.ContributorId,
+      revision: Long
+  ): Either[SnapError, Model.Change] =
+    ast match {
+      case obj: ZJson.Obj =>
+        objectFields(obj).flatMap { fields =>
+          // Validate the discriminator first so the unknown-field check uses the right allowed set.
+          requiredString(fields, "type", "change").flatMap {
+            case typ @ ("text" | "put" | "delete") =>
+              val allowed = typ match {
+                case "text"   => TextFields
+                case "put"    => PutFields
+                case "delete" => DeleteFields
+              }
+              findUnknown(fields, allowed) match {
+                case Some(k) =>
+                  Left(SnapError.UnknownChangeField(k, author.value, revision))
+                case None =>
+                  typ match {
+                    case "text" =>
+                      for {
+                        path <- requiredString(fields, "path", "change")
+                        _ <- Model.validatePath(path)
+                        edit <- requiredArray(fields, "edit", "change")
+                        ops <- seqEither(edit.elements.toVector.map(editOpFromAst(_, path)))
+                      } yield Model.Change.Text(path, ops)
+                    case "put" =>
+                      for {
+                        path <- requiredString(fields, "path", "change")
+                        _ <- Model.validatePath(path)
+                        content <- requiredString(fields, "content", "change")
+                        bytes <- Model.decodeCanonicalBase64(content, path)
+                      } yield Model.Change.Put(path, bytes)
+                    case "delete" =>
+                      for {
+                        path <- requiredString(fields, "path", "change")
+                        _ <- Model.validatePath(path)
+                      } yield Model.Change.Del(path)
+                  }
+              }
+            case other =>
+              Left(
+                SnapError.InvalidJson(s"change type must be text, put, or delete (got '$other')")
+              )
+          }
+        }
+      case _ => Left(SnapError.InvalidJson("change must be a JSON object"))
+    }
+
+  private def editOpFromAst(ast: ZJson, path: String): Either[SnapError, Model.EditOp] =
+    ast match {
+      case obj: ZJson.Obj =>
+        objectFields(obj).flatMap { fields =>
+          if (fields.length != 1) Left(SnapError.EditOpWrongArity)
+          else
+            fields.head match {
+              case ("retain", ZJson.Num(n)) =>
+                Model.positiveSafeInteger(n, "retain count").map(Model.EditOp.Retain.apply)
+              case ("delete", ZJson.Num(n)) =>
+                Model.positiveSafeInteger(n, "delete count").map(Model.EditOp.Delete.apply)
+              case ("insert", ZJson.Arr(items)) =>
+                if (items.isEmpty) Left(SnapError.EmptyField("edit", "insert"))
+                else
+                  seqEither(
+                    items.toVector.map {
+                      case ZJson.Str(s) => Right[SnapError, String](s)
+                      case _ =>
+                        Left[SnapError, String](
+                          SnapError.InvalidJson("edit insert entries must be strings")
+                        )
+                    }
+                  ).flatMap { tokens =>
+                    if (tokens.forall(Model.isValidInsertToken))
+                      Right(Model.EditOp.Insert(tokens))
+                    else Left(SnapError.NonCanonicalTokens(path))
+                  }
+              case (_, _) => Left(SnapError.EditOpWrongArity)
+            }
+        }
+      case _ => Left(SnapError.EditOpWrongArity)
+    }
+
+  // ---------------------------------------------------------------------------
+  // AST -> Model conversion (config)
+  // ---------------------------------------------------------------------------
+
+  private def configFileFromAst(ast: ZJson): Either[SnapError, ConfigFile] =
+    ast match {
+      case obj: ZJson.Obj =>
+        for {
+          fields <- objectFields(obj)
+          _ <- findUnknown(fields, ConfigFields) match {
+            case Some(k) => Left(SnapError.InvalidJson(s"config: unknown field '$k'"))
+            case None    => Right(())
+          }
+          contrib <- find(fields, "contributor") match {
+            case Some(o: ZJson.Obj) => Right(o)
+            case Some(_) =>
+              Left(SnapError.InvalidJson("config: 'contributor' must be an object"))
+            case None =>
+              Left(SnapError.InvalidJson("config: missing field 'contributor'"))
+          }
+          cfields <- objectFields(contrib)
+          _ <- findUnknown(cfields, ContribFields) match {
+            case Some(k) =>
+              Left(SnapError.InvalidJson(s"config contributor: unknown field '$k'"))
+            case None => Right(())
+          }
+          idStr <- requiredString(cfields, "id", "config contributor")
+          id <- Model.ContributorId.parse(idStr)
+        } yield ConfigFile(id)
+      case _ => Left(SnapError.InvalidJson("config must be a JSON object"))
+    }
+
+  // ---------------------------------------------------------------------------
+  // Small shared AST helpers
+  // ---------------------------------------------------------------------------
+
+  /** Field list of an object, rejecting duplicate keys (SPEC §4.1 unique object keys). */
+  private def objectFields(obj: ZJson.Obj): Either[SnapError, Fields] = {
+    val seen = scala.collection.mutable.HashSet.empty[String]
+    val b = Vector.newBuilder[(String, ZJson)]
+    val it = obj.fields.iterator
+    while (it.hasNext) {
+      val (key, value) = it.next()
+      if (!seen.add(key)) return Left(SnapError.DuplicateJsonKey(key))
+      b += ((key, value))
+    }
+    Right(b.result())
+  }
+
+  private def find(fields: Fields, name: String): Option[ZJson] =
+    fields.collectFirst { case (k, v) if k == name => v }
+
+  private def findUnknown(fields: Fields, allowed: Set[String]): Option[String] =
+    fields.collectFirst { case (k, _) if !allowed.contains(k) => k }
+
+  private def requiredString(
+      fields: Fields,
+      name: String,
+      what: String
+  ): Either[SnapError, String] =
+    find(fields, name) match {
+      case Some(ZJson.Str(s)) => Right(s)
+      case Some(_) => Left(SnapError.InvalidJson(s"$what: field '$name' must be a string"))
+      case None    => Left(SnapError.InvalidJson(s"$what: missing field '$name'"))
+    }
+
+  private def requiredNumber(
+      fields: Fields,
+      name: String,
+      what: String
+  ): Either[SnapError, JBigDecimal] =
+    find(fields, name) match {
+      case Some(ZJson.Num(n)) => Right(n)
+      case Some(_) => Left(SnapError.InvalidJson(s"$what: field '$name' must be a number"))
+      case None    => Left(SnapError.InvalidJson(s"$what: missing field '$name'"))
+    }
+
+  private def requiredArray(
+      fields: Fields,
+      name: String,
+      what: String
+  ): Either[SnapError, ZJson.Arr] =
+    find(fields, name) match {
+      case Some(a: ZJson.Arr) => Right(a)
+      case Some(_) => Left(SnapError.InvalidJson(s"$what: field '$name' must be an array"))
+      case None    => Left(SnapError.InvalidJson(s"$what: missing field '$name'"))
+    }
+
+  private def seqEither[A](xs: Vector[Either[SnapError, A]]): Either[SnapError, Vector[A]] = {
+    val b = Vector.newBuilder[A]
+    val it = xs.iterator
+    while (it.hasNext) {
+      it.next() match {
+        case Left(e)  => return Left(e)
+        case Right(a) => b += a
+      }
+    }
+    Right(b.result())
+  }
+
+  private def isBlankAfter(s: String, from: Int): Boolean = {
+    var i = from
+    while (i < s.length) {
+      val c = s.charAt(i)
+      if (c != ' ' && c != '\t' && c != '\n' && c != '\r') return false
+      i += 1
+    }
+    true
+  }
+
+  /** Index just past the first complete top-level JSON value. Assumes `input` already parsed; this
+    * only locates the value boundary so strict mode can detect trailing bytes.
+    */
+  private def firstValueEnd(s: String): Option[Int] = {
+    var pos = 0
+    val n = s.length
+
+    def isWs(c: Char): Boolean = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+    def skipWs(): Unit =
+      while (pos < n && isWs(s.charAt(pos))) pos += 1
+
+    def scanString(): Boolean =
+      if (pos >= n || s.charAt(pos) != '"') false
+      else {
+        pos += 1
+        var closed = false
+        var failed = false
+        while (!closed && !failed && pos < n) {
+          val c = s.charAt(pos)
+          if (c == '"') {
+            pos += 1
+            closed = true
+          } else if (c == '\\') {
+            if (pos + 1 >= n) failed = true
+            else if (s.charAt(pos + 1) == 'u') {
+              if (pos + 6 > n) failed = true
+              else pos += 6
+            } else pos += 2
+          } else pos += 1
+        }
+        closed
+      }
+
+    def scanExponent(): Boolean =
+      if (pos < n && (s.charAt(pos) == 'e' || s.charAt(pos) == 'E')) {
+        pos += 1
+        if (pos < n && (s.charAt(pos) == '+' || s.charAt(pos) == '-')) pos += 1
+        var digits = 0
+        while (pos < n && s.charAt(pos).isDigit) {
+          pos += 1
+          digits += 1
+        }
+        digits > 0
+      } else true
+
+    def scanNumber(): Boolean = {
+      if (pos < n && s.charAt(pos) == '-') pos += 1
+      var digits = 0
+      while (pos < n && s.charAt(pos).isDigit) {
+        pos += 1
+        digits += 1
+      }
+      if (digits == 0) false
+      else if (pos < n && s.charAt(pos) == '.') {
+        pos += 1
+        var fractionDigits = 0
+        while (pos < n && s.charAt(pos).isDigit) {
+          pos += 1
+          fractionDigits += 1
+        }
+        fractionDigits > 0 && scanExponent()
+      } else scanExponent()
+    }
+
+    def scanLiteral(word: String): Boolean =
+      if (pos + word.length <= n && s.regionMatches(pos, word, 0, word.length)) {
+        pos += word.length
+        true
+      } else false
+
+    def scanObject(): Boolean = {
+      pos += 1
+      skipWs()
+      if (pos < n && s.charAt(pos) == '}') {
+        pos += 1
+        true
+      } else {
+        var ok = true
+        var done = false
+        while (ok && !done) {
+          skipWs()
+          if (!scanString()) ok = false
+          else {
+            skipWs()
+            if (pos >= n || s.charAt(pos) != ':') ok = false
+            else {
+              pos += 1
+              if (!scanValue()) ok = false
+              else {
+                skipWs()
+                if (pos >= n) ok = false
+                else
+                  s.charAt(pos) match {
+                    case ',' => pos += 1
+                    case '}' =>
+                      pos += 1
+                      done = true
+                    case _ => ok = false
+                  }
+              }
+            }
+          }
+        }
+        ok && done
+      }
+    }
+
+    def scanArray(): Boolean = {
+      pos += 1
+      skipWs()
+      if (pos < n && s.charAt(pos) == ']') {
+        pos += 1
+        true
+      } else {
+        var ok = true
+        var done = false
+        while (ok && !done) {
+          if (!scanValue()) ok = false
+          else {
+            skipWs()
+            if (pos >= n) ok = false
+            else
+              s.charAt(pos) match {
+                case ',' => pos += 1
+                case ']' =>
+                  pos += 1
+                  done = true
+                case _ => ok = false
+              }
+          }
+        }
+        ok && done
+      }
+    }
+
+    def scanValue(): Boolean = {
+      skipWs()
+      if (pos >= n) false
+      else
+        s.charAt(pos) match {
+          case '{'                                     => scanObject()
+          case '['                                     => scanArray()
+          case '"'                                     => scanString()
+          case 't'                                     => scanLiteral("true")
+          case 'f'                                     => scanLiteral("false")
+          case 'n'                                     => scanLiteral("null")
+          case c if c == '-' || (c >= '0' && c <= '9') => scanNumber()
+          case _                                       => false
+        }
+    }
+
+    skipWs()
+    if (scanValue()) Some(pos) else None
+  }
+
+  // ---------------------------------------------------------------------------
+  // Canonical writer (Node JSON.stringify(value, null, 2) compatible)
+  // ---------------------------------------------------------------------------
+
+  private def pad(sb: StringBuilder, level: Int): Unit = {
     var i = 0
-    while (i < indent) { sb.append("  "); i += 1 }
+    while (i < level) {
+      sb.append("  ")
+      i += 1
+    }
   }
 
-  private def writeValue(sb: StringBuilder, v: Value, indent: Int): Unit = v match {
-    case JNull     => sb.append("null")
-    case JBool(b)  => sb.append(b.toString)
-    case JNum(raw) => sb.append(raw)
-    case JStr(s)   => writeString(sb, s)
-    case JArr(items) =>
-      if (items.isEmpty) sb.append("[]")
-      else {
-        sb.append("[\n")
-        var first = true
-        for (item <- items) {
-          if (!first) sb.append(",\n")
-          first = false
-          pad(sb, indent + 1)
-          writeValue(sb, item, indent + 1)
-        }
-        sb.append('\n')
-        pad(sb, indent)
-        sb.append(']')
-      }
-    case JObj(entries) =>
-      if (entries.isEmpty) sb.append("{}")
-      else {
-        sb.append("{\n")
-        var first = true
-        for ((k, value) <- entries) {
-          if (!first) sb.append(",\n")
-          first = false
-          pad(sb, indent + 1)
-          writeString(sb, k)
-          sb.append(": ")
-          writeValue(sb, value, indent + 1)
-        }
-        sb.append('\n')
-        pad(sb, indent)
-        sb.append('}')
-      }
+  private def writeVersion(sb: StringBuilder, v: Model.Version, level: Int): Unit = {
+    val cs = v.components
+    if (cs.isEmpty) { sb.append("[]"); return }
+    sb.append("[\n")
+    var i = 0
+    while (i < cs.length) {
+      val (id, rev) = cs(i)
+      pad(sb, level + 1)
+      sb.append("[\n")
+      pad(sb, level + 2)
+      writeString(sb, id.value)
+      sb.append(",\n")
+      pad(sb, level + 2)
+      sb.append(rev.toString)
+      sb.append('\n')
+      pad(sb, level + 1)
+      sb.append(']')
+      if (i < cs.length - 1) sb.append(',')
+      sb.append('\n')
+      i += 1
+    }
+    pad(sb, level)
+    sb.append(']')
   }
 
-  /** JSON string escaping compatible with JSON.stringify: named escapes for \b \f \n \r \t, \" and
-    * \\, \u00xx for other control characters.
+  private def writePatches(sb: StringBuilder, patches: Vector[Model.Patch], level: Int): Unit = {
+    if (patches.isEmpty) { sb.append("[]"); return }
+    sb.append("[\n")
+    var i = 0
+    while (i < patches.length) {
+      pad(sb, level + 1)
+      writePatch(sb, patches(i), level + 1)
+      if (i < patches.length - 1) sb.append(',')
+      sb.append('\n')
+      i += 1
+    }
+    pad(sb, level)
+    sb.append(']')
+  }
+
+  private def writePatch(sb: StringBuilder, p: Model.Patch, level: Int): Unit = {
+    val k = level + 1
+    sb.append("{\n")
+    pad(sb, k); sb.append("\"author\": "); writeString(sb, p.author.value); sb.append(",\n")
+    pad(sb, k); sb.append("\"revision\": "); sb.append(p.revision.toString); sb.append(",\n")
+    pad(sb, k); sb.append("\"base\": "); writeVersion(sb, p.base, k); sb.append(",\n")
+    pad(sb, k); sb.append("\"message\": "); writeString(sb, p.message); sb.append(",\n")
+    pad(sb, k); sb.append("\"changes\": "); writeChanges(sb, p.changes, k); sb.append('\n')
+    pad(sb, level)
+    sb.append('}')
+  }
+
+  private def writeChanges(sb: StringBuilder, changes: Vector[Model.Change], level: Int): Unit = {
+    if (changes.isEmpty) { sb.append("[]"); return }
+    sb.append("[\n")
+    var i = 0
+    while (i < changes.length) {
+      pad(sb, level + 1)
+      writeChange(sb, changes(i), level + 1)
+      if (i < changes.length - 1) sb.append(',')
+      sb.append('\n')
+      i += 1
+    }
+    pad(sb, level)
+    sb.append(']')
+  }
+
+  private def writeChange(sb: StringBuilder, c: Model.Change, level: Int): Unit = {
+    val k = level + 1
+    sb.append("{\n")
+    c match {
+      case Model.Change.Text(path, edit) =>
+        pad(sb, k); sb.append("\"type\": \"text\",\n")
+        pad(sb, k); sb.append("\"path\": "); writeString(sb, path); sb.append(",\n")
+        pad(sb, k); sb.append("\"edit\": "); writeEditOps(sb, edit, k); sb.append('\n')
+      case Model.Change.Put(path, bytes) =>
+        pad(sb, k); sb.append("\"type\": \"put\",\n")
+        pad(sb, k); sb.append("\"path\": "); writeString(sb, path); sb.append(",\n")
+        pad(sb, k); sb.append("\"content\": "); writeString(sb, Model.encodeBase64(bytes));
+        sb.append('\n')
+      case Model.Change.Del(path) =>
+        pad(sb, k); sb.append("\"type\": \"delete\",\n")
+        pad(sb, k); sb.append("\"path\": "); writeString(sb, path); sb.append('\n')
+    }
+    pad(sb, level)
+    sb.append('}')
+  }
+
+  private def writeEditOps(sb: StringBuilder, ops: Vector[Model.EditOp], level: Int): Unit = {
+    if (ops.isEmpty) { sb.append("[]"); return }
+    sb.append("[\n")
+    var i = 0
+    while (i < ops.length) {
+      pad(sb, level + 1)
+      writeEditOp(sb, ops(i), level + 1)
+      if (i < ops.length - 1) sb.append(',')
+      sb.append('\n')
+      i += 1
+    }
+    pad(sb, level)
+    sb.append(']')
+  }
+
+  private def writeEditOp(sb: StringBuilder, op: Model.EditOp, level: Int): Unit = {
+    val k = level + 1
+    sb.append("{\n")
+    op match {
+      case Model.EditOp.Retain(n) =>
+        pad(sb, k); sb.append("\"retain\": "); sb.append(n.toString); sb.append('\n')
+      case Model.EditOp.Delete(n) =>
+        pad(sb, k); sb.append("\"delete\": "); sb.append(n.toString); sb.append('\n')
+      case Model.EditOp.Insert(tokens) =>
+        pad(sb, k); sb.append("\"insert\": "); writeInsertTokens(sb, tokens, k); sb.append('\n')
+    }
+    pad(sb, level)
+    sb.append('}')
+  }
+
+  private def writeInsertTokens(sb: StringBuilder, tokens: Vector[String], level: Int): Unit = {
+    if (tokens.isEmpty) { sb.append("[]"); return }
+    sb.append("[\n")
+    var i = 0
+    while (i < tokens.length) {
+      pad(sb, level + 1)
+      writeString(sb, tokens(i))
+      if (i < tokens.length - 1) sb.append(',')
+      sb.append('\n')
+      i += 1
+    }
+    pad(sb, level)
+    sb.append(']')
+  }
+
+  /** JSON string escaping compatible with `JSON.stringify`: named escapes for \b \f \n \r \t, `\"`
+    * and `\\`, `\u00xx` (lowercase hex) for other control characters, and escaped lone surrogates.
     */
   private def writeString(sb: StringBuilder, s: String): Unit = {
     sb.append('"')
@@ -326,8 +692,17 @@ object Json {
         case '\r' => sb.append("\\r")
         case '\t' => sb.append("\\t")
         case _ if c < 0x20 =>
-          sb.append("\\u")
-          sb.append(f"${c.toInt}%04x")
+          sb.append(f"\\u${c.toInt}%04x")
+        case _ if Character.isHighSurrogate(c) =>
+          if (i + 1 < s.length && Character.isLowSurrogate(s.charAt(i + 1))) {
+            sb.append(c)
+            sb.append(s.charAt(i + 1))
+            i += 1
+          } else {
+            sb.append(f"\\u${c.toInt}%04x")
+          }
+        case _ if Character.isLowSurrogate(c) =>
+          sb.append(f"\\u${c.toInt}%04x")
         case _ => sb.append(c)
       }
       i += 1
