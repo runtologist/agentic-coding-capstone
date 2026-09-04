@@ -113,12 +113,15 @@ object Commands {
         cause.failureOrCause match {
           case Left(err) => (out.writeErr(Render.errorLine(err, pErr)) *> out.flushErr).as(1)
           case Right(defect) =>
-            val dbg =
-              if (env.snapDebug)
-                ZIO.succeed(java.lang.System.err.println(defect.prettyPrint))
-              else ZIO.unit
-            (dbg *> out.writeErr(Render.errorLine(SnapError.InternalError, pErr)) *>
-              out.flushErr).as(2)
+            if (defect.dieOption.contains(Jnu.ReexecRequired)) ZIO.succeed(Jnu.ReexecCode)
+            else {
+              val dbg =
+                if (env.snapDebug)
+                  ZIO.succeed(java.lang.System.err.println(defect.prettyPrint))
+                else ZIO.unit
+              (dbg *> out.writeErr(Render.errorLine(SnapError.InternalError, pErr)) *>
+                out.flushErr).as(2)
+            }
         }
     }
 
@@ -491,12 +494,15 @@ object Commands {
             case Left(err) =>
               (out.writeErr(Render.errorLine(err, pErr)) *> out.flushErr).as(1)
             case Right(defect) =>
-              val dbg =
-                if (env.snapDebug)
-                  ZIO.succeed(java.lang.System.err.println(defect.prettyPrint))
-                else ZIO.unit
-              (dbg *> out.writeErr(Render.errorLine(SnapError.InternalError, pErr)) *>
-                out.flushErr).as(2)
+              if (defect.dieOption.contains(Jnu.ReexecRequired)) ZIO.succeed(Jnu.ReexecCode)
+              else {
+                val dbg =
+                  if (env.snapDebug)
+                    ZIO.succeed(java.lang.System.err.println(defect.prettyPrint))
+                  else ZIO.unit
+                (dbg *> out.writeErr(Render.errorLine(SnapError.InternalError, pErr)) *>
+                  out.flushErr).as(2)
+              }
           },
         _ => ZIO.succeed(0)
       )

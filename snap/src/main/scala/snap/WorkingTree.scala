@@ -72,8 +72,10 @@ object WorkingTree {
       sorted <- listSortedChildren(dir)
       collected <- ZIO.foreach(sorted) { entry =>
         val name = entry.getFileName.toString
+        // F-utf8b: if lossy decoding produced a replacement character, re-exec is needed.
+        if (Jnu.decodedNameNeedsReexec(Jnu.lossyRisk, name)) ZIO.die(Jnu.ReexecRequired)
         // The repository's own metadata directory is never tracked (SPEC §2).
-        if (isTop && name == SnapDirName) ZIO.succeed(Vector.empty[(String, Array[Byte])])
+        else if (isTop && name == SnapDirName) ZIO.succeed(Vector.empty[(String, Array[Byte])])
         else scanEntry(entry, relPath(prefix, name))
       }
     } yield collected.flatten
@@ -137,6 +139,11 @@ object WorkingTree {
     val targetPaths = target.keySet
     for {
       currentFiles <- collectRegularFiles(absRoot)
+      // F-utf8b: if any path to write or delete contains non-ASCII chars, re-exec is needed.
+      _ <-
+        if (Jnu.writeNeedsReexec(Jnu.lossyRisk, targetPaths ++ currentFiles))
+          ZIO.die(Jnu.ReexecRequired)
+        else ZIO.unit
       removedAncestors <- ZIO.foreach(currentFiles.filterNot(targetPaths.contains)) { rel =>
         val file = absRoot.resolve(rel)
         fs(Files.deleteIfExists(file)).as(ancestorsOf(file, absRoot))
