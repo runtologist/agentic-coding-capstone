@@ -50,7 +50,7 @@ CI installs Java/sbt itself.
 In the workshop root:
 
 ```bash
-git clone git@github.com:runtologist/.git
+git clone git@github.com:runtologist/agentic-coding-capstone.git
 ```
 
 then 
