@@ -555,3 +555,42 @@ Coverage extension wave (parallel subagents):
 5. Record lane commits, merged HEAD, and before/after coverage numbers in
    the ledger.
 
+## 11. Driver / coordinator discipline
+
+The main (parent) agent is a **driver/coordinator only**. Substantive work is
+delegated to subagents even when it cannot be parallelized, so the driver's
+context stays small and survives compaction.
+
+What the driver keeps:
+
+- Goal state, constraints, and quality gates.
+- Task decomposition into cold-start packets with disjoint file ownership.
+- The project ledger (lanes, branches, commits, gate evidence, rulings).
+- Integration authority: merging lane branches, accepting/rejecting results,
+  conflict resolution (or delegating it).
+- User-facing decisions: scope changes, ambiguities, pushes, history rewrites.
+
+What the driver delegates to subagents:
+
+- Reading large files and summarizing them.
+- Writing/editing code and tests.
+- Running sbt gate suites and the official harness, digesting their logs.
+- Debugging failures and review passes.
+
+Sequential work still gets delegated: define one packet, dispatch one worker,
+receive its report, then decide the next step. Do not implement in the driver
+session just because a step cannot run in parallel.
+
+Compact-report contract: every lane/subagent must finish with a short
+structured report — lane key, status, branch, commit SHA(s), files changed,
+tests added/total, gate evidence, parked items, risks. Full logs stay in the
+subagent session or an artifact file; only the summary enters the driver's
+context.
+
+Anti-patterns:
+
+- The driver reading whole source files or full sbt logs into its own context.
+- The driver hand-editing implementation code instead of dispatching a worker.
+- Re-dispatching work the ledger already records as complete (check the ledger,
+  `git log`, active runs, and `git worktree list` after any compaction).
+
